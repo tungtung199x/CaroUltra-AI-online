@@ -327,11 +327,11 @@ async def handler(websocket):
                 await send_json(client, timer_message)
 
             # Kích hoạt đếm ngược thời gian cho lượt đi tiếp theo nếu turn_limit > 0
-            if payload.get("type") == "move" and room_id:
-                async def timeout_task(expected_symbol):
+            if payload.get("type") == "move" and room_id and turn_limit > 0:
+                async def timeout_task(expected_symbol, limit_seconds):
                     try:
-                        # Mặc định thời gian đếm ngược mỗi lượt là 35 giây (hoặc thay bằng biến turn_limit của bạn)
-                        await asyncio.sleep(35)
+                        # Sử dụng đúng số giây giới hạn của lượt thay vì số 35 cứng
+                        await asyncio.sleep(limit_seconds)
                         async with rooms_lock:
                             current_room = rooms.get(room_id)
                             if not current_room or current_room[0].get("turn_symbol") != expected_symbol:
@@ -350,7 +350,7 @@ async def handler(websocket):
                 async with rooms_lock:
                     current_room = rooms.get(room_id)
                     if current_room:
-                        current_room[0]["turn_task"] = asyncio.create_task(timeout_task(next_symbol))
+                        current_room[0]["turn_task"] = asyncio.create_task(timeout_task(next_symbol, turn_limit))
 
     except websockets.exceptions.ConnectionClosed:
         pass
