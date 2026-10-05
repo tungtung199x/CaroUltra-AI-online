@@ -310,8 +310,6 @@ async def handler(websocket):
                 await send_json(client, timer_message)
 
             # Tạo timer đếm ngược nếu phòng có bật giới hạn thời gian (turn_limit > 0)
-            turn_limit = current_room[0].get("turn_time_limit", 35)
-            # Tạo timer đếm ngược nếu phòng có bật giới hạn thời gian (turn_limit > 0)
             turn_limit = room[0].get("turn_time_limit", 35)
             if payload.get("type") == "move" and room_id and turn_limit > 0:
                 async def timeout_task(expected_symbol):
