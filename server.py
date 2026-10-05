@@ -24,6 +24,7 @@ rooms_lock = asyncio.Lock()
 
 MAX_NAME_LENGTH = 24
 MAX_ROOM_LENGTH = 32
+TURN_TIME_LIMIT = 20
 
 
 def clean_name(name):
@@ -97,6 +98,9 @@ async def remove_player(room_id, websocket):
             return
 
         room.remove(player)
+        task = player.get("turn_task")
+        if task and not task.done():
+            task.cancel()
         remaining_players = list(room)
 
         if not remaining_players:
@@ -160,11 +164,15 @@ async def handler(websocket):
             "ws": websocket,
             "name": player_name,
             "symbol": None,
+            "turn_task": None,
+            "turn_symbol": None,
         }
 
         start_messages = []
         opponent_joined_messages = []
+        turn_start_messages = []
         waiting_message = None
+        turn_task = None
 
         # --------------------------------------------------------
         # 2. Thêm người chơi vào phòng
@@ -238,6 +246,14 @@ async def handler(websocket):
                     ),
                 ]
 
+                turn_start_messages = [
+                    (p["ws"], {
+                        "type": "turn_start",
+                        "symbol": "X",
+                        "seconds": TURN_TIME_LIMIT,
+                    }) for p in room
+                ]
+
         # --------------------------------------------------------
         # 3. Gửi thông báo sau khi cập nhật room
         # --------------------------------------------------------
@@ -249,25 +265,110 @@ async def handler(websocket):
 
         for ws, message in start_messages:
             await send_json(ws, message)
+        for ws, message in turn_start_messages:
+            await send_json(ws, message)
+
+        # Timer 20 giây cho nước đầu tiên: X được đi trước.
+        if turn_start_messages and room_id:
+            async def first_turn_timeout():
+                try:
+                    await asyncio.sleep(TURN_TIME_LIMIT)
+                    async with rooms_lock:
+                        current_room = rooms.get(room_id)
+                        if not current_room or current_room[0].get("turn_symbol") != "X":
+                            return
+                        current_room[0]["turn_symbol"] = None
+                        recipients = list(current_room)
+                    for p in recipients:
+                        await send_json(p["ws"], {"type": "timeout", "loser": "X", "seconds": 0})
+                except asyncio.CancelledError:
+                    return
+            async with rooms_lock:
+                room = rooms.get(room_id)
+                if room:
+                    room[0]["turn_symbol"] = "X"
+                    room[0]["turn_task"] = asyncio.create_task(first_turn_timeout())
 
         # --------------------------------------------------------
         # 4. Relay dữ liệu Caro
         # --------------------------------------------------------
         async for message in websocket:
+            try:
+                payload = json.loads(message)
+            except (json.JSONDecodeError, TypeError):
+                continue
+
             async with rooms_lock:
                 room = rooms.get(room_id)
-
                 if not room:
                     break
 
-                clients = [
-                    p["ws"]
-                    for p in room
-                    if p["ws"] is not websocket
-                ]
+                sender = next((p for p in room if p["ws"] is websocket), None)
+                if sender is None:
+                    break
 
-            for client in clients:
-                await relay_message(client, message)
+                clients = [p for p in room if p["ws"] is not websocket]
+
+                # Online server là trọng tài cho 20 giây/lượt.
+                if payload.get("type") == "move":
+                    current = next((p for p in room if p.get("symbol") == room[0].get("turn_symbol")), None) if room else None
+                    room_turn = room[0].get("turn_symbol") if room else None
+                    if room_turn and sender.get("symbol") != room_turn:
+                        continue
+
+                    room[0]["turn_symbol"] = "O" if sender.get("symbol") == "X" else "X"
+                    next_symbol = room[0]["turn_symbol"]
+                    # Hủy timer cũ.
+                    old_task = room[0].get("turn_task")
+                    if old_task and not old_task.done():
+                        old_task.cancel()
+                    room[0]["turn_task"] = None
+
+                    outgoing = [(p["ws"], message) for p in clients]
+                    turn_start = [(p["ws"], {
+                        "type": "turn_start",
+                        "symbol": next_symbol,
+                        "seconds": TURN_TIME_LIMIT,
+                    }) for p in room]
+                elif payload.get("type") == "rematch":
+                    # Client hiện tại tự đổi X/O khi cả hai cùng sẵn sàng.
+                    # Server chỉ relay tín hiệu, không tự ép lại symbol.
+                    outgoing = [(p["ws"], message) for p in clients]
+                    turn_start = []
+                else:
+                    outgoing = [(p["ws"], message) for p in clients]
+                    turn_start = []
+
+            for client, outgoing_message in outgoing:
+                await relay_message(client, outgoing_message)
+            for client, timer_message in turn_start:
+                await send_json(client, timer_message)
+
+            # Tạo timer sau khi gửi nước đi.
+            if payload.get("type") == "move" and room_id:
+                async def timeout_task(expected_symbol):
+                    try:
+                        await asyncio.sleep(TURN_TIME_LIMIT)
+                        async with rooms_lock:
+                            current_room = rooms.get(room_id)
+                            if not current_room or current_room[0].get("turn_symbol") != expected_symbol:
+                                return
+                            current_room[0]["turn_symbol"] = None
+                            recipients = list(current_room)
+                        for p in recipients:
+                            await send_json(p["ws"], {
+                                "type": "timeout",
+                                "loser": expected_symbol,
+                                "seconds": 0,
+                            })
+                    except asyncio.CancelledError:
+                        return
+
+                async with rooms_lock:
+                    current_room = rooms.get(room_id)
+                    if current_room:
+                        current_room[0]["turn_task"] = asyncio.create_task(timeout_task(next_symbol))
+
 
     except websockets.exceptions.ConnectionClosed:
         pass
