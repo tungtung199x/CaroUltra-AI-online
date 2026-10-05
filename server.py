@@ -138,6 +138,13 @@ async def handler(websocket):
 
         room_id = clean_room(data.get("room"))
         player_name = clean_name(data.get("name"))
+        
+        # === NHẬN THÊM CẤU HÌNH THỜI GIAN TỪ CLIENT ===
+        try:
+            client_time_limit = int(data.get("time_limit", 35))
+        except (ValueError, TypeError):
+            client_time_limit = 35
+        # ===============================================
 
         if not room_id:
             await send_json(websocket, {
@@ -152,6 +159,7 @@ async def handler(websocket):
             "symbol": None,
             "turn_task": None,
             "turn_symbol": None,
+            "time_limit": client_time_limit, # Lưu thời gian của người tạo phòng
         }
 
         start_messages = []
@@ -185,7 +193,10 @@ async def handler(websocket):
 
                 player_x["symbol"] = "X"
                 player_o["symbol"] = "O"
-                room[0]["turn_symbol"] = "X"  # Đặt lượt X đi trước nhưng CHƯA kích hoạt timer đếm ngược
+                room[0]["turn_symbol"] = "X"  
+                
+                # Lưu time_limit của người tạo phòng (player_x) làm quy chuẩn cho cả phòng
+                room[0]["turn_time_limit"] = player_x.get("time_limit", 35)
 
                 opponent_joined_messages = [
                     (
@@ -298,11 +309,12 @@ async def handler(websocket):
             for client, timer_message in turn_start:
                 await send_json(client, timer_message)
 
-            # Tạo timer đếm ngược 25 giây cho lượt tiếp theo ngay khi nhận được nước đi
-            if payload.get("type") == "move" and room_id:
+            # Tạo timer đếm ngược nếu phòng có bật giới hạn thời gian (turn_limit > 0)
+            turn_limit = current_room[0].get("turn_time_limit", 35)
+            if payload.get("type") == "move" and room_id and turn_limit > 0:
                 async def timeout_task(expected_symbol):
                     try:
-                        await asyncio.sleep(TURN_TIME_LIMIT)
+                        await asyncio.sleep(turn_limit)
                         async with rooms_lock:
                             current_room = rooms.get(room_id)
                             if not current_room or current_room[0].get("turn_symbol") != expected_symbol:
