@@ -15,8 +15,7 @@ rooms_lock = asyncio.Lock()
 
 MAX_NAME_LENGTH = 24
 MAX_ROOM_LENGTH = 32
-TURN_TIME_LIMIT = 25  # Đã đổi đồng bộ thành 25 giây mỗi lượt
-
+TURN_TIME_LIMIT = 35
 
 def clean_name(name):
     """Làm sạch tên người chơi."""
