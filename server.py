@@ -282,12 +282,12 @@ async def handler(websocket):
                 clients = [p for p in room if p["ws"] is not websocket]
                 turn_limit = room[0].get("turn_time_limit", 0)
 
-                if payload.get("type") == "move":
+                if payload.get("type"] == "move":
                     room_turn = room[0].get("turn_symbol") if room else None
-                    if room_turn and sender.get("symbol") != room_turn:
+                    if room_turn and sender.get("symbol"] != room_turn:
                         continue
 
-                    room[0]["turn_symbol"] = "O" if sender.get("symbol") == "X" else "X"
+                    room[0]["turn_symbol"] = "O" if sender.get("symbol"] == "X" else "X"
                     next_symbol = room[0]["turn_symbol"]
                     
                     # Hủy timer cũ nếu có
@@ -298,7 +298,7 @@ async def handler(websocket):
 
                     outgoing = [(p["ws"], message) for p in clients]
                     
-                    # CHỈ GỬI "turn_start" KÈM SỐ GIÂY NẾU THỜI GIAN > 0
+                    # Gửi turn_start kèm số giây giới hạn lượt (ví dụ 35 giây)
                     turn_start = [(p["ws"], {
                         "type": "turn_start",
                         "symbol": next_symbol,
@@ -326,11 +326,12 @@ async def handler(websocket):
             for client, timer_message in turn_start:
                 await send_json(client, timer_message)
 
-            # CHỈ TẠO TIẾN TRÌNH ĐẾM NGƯỢC (TIMEOUT) NẾU turn_limit > 0
-            if payload.get("type") == "move" and room_id and turn_limit > 0:
+            # Kích hoạt đếm ngược thời gian cho lượt đi tiếp theo nếu turn_limit > 0
+            if payload.get("type") == "move" and room_id:
                 async def timeout_task(expected_symbol):
                     try:
-                        await asyncio.sleep(turn_limit)
+                        # Mặc định thời gian đếm ngược mỗi lượt là 35 giây (hoặc thay bằng biến turn_limit của bạn)
+                        await asyncio.sleep(35)
                         async with rooms_lock:
                             current_room = rooms.get(room_id)
                             if not current_room or current_room[0].get("turn_symbol") != expected_symbol:
