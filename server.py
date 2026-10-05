@@ -282,12 +282,12 @@ async def handler(websocket):
                 clients = [p for p in room if p["ws"] is not websocket]
                 turn_limit = room[0].get("turn_time_limit", 0)
 
-                if payload.get("type"] == "move":
+                if payload.get("type") == "move":
                     room_turn = room[0].get("turn_symbol") if room else None
-                    if room_turn and sender.get("symbol"] != room_turn:
+                    if room_turn and sender.get("symbol") != room_turn:
                         continue
 
-                    room[0]["turn_symbol"] = "O" if sender.get("symbol"] == "X" else "X"
+                    room[0]["turn_symbol"] = "O" if sender.get("symbol") == "X" else "X"
                     next_symbol = room[0]["turn_symbol"]
                     
                     # Hủy timer cũ nếu có
@@ -298,7 +298,7 @@ async def handler(websocket):
 
                     outgoing = [(p["ws"], message) for p in clients]
                     
-                    # Gửi turn_start kèm số giây giới hạn lượt (ví dụ 35 giây)
+                    # Gửi turn_start kèm số giây giới hạn lượt chuẩn xác
                     turn_start = [(p["ws"], {
                         "type": "turn_start",
                         "symbol": next_symbol,
@@ -330,7 +330,6 @@ async def handler(websocket):
             if payload.get("type") == "move" and room_id and turn_limit > 0:
                 async def timeout_task(expected_symbol, limit_seconds):
                     try:
-                        # Sử dụng đúng số giây giới hạn của lượt thay vì số 35 cứng
                         await asyncio.sleep(limit_seconds)
                         async with rooms_lock:
                             current_room = rooms.get(room_id)
