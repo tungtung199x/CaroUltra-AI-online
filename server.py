@@ -304,12 +304,15 @@ async def handler(websocket):
                         "symbol": next_symbol,
                         "seconds": turn_limit,
                     }) for p in room]
-                elif payload.get("type") == "rematch":
-                    outgoing = [(p["ws"], message) for p in clients]
-                    turn_start = []
-                else:
-                    outgoing = [(p["ws"], message) for p in clients]
-                    turn_start = []
+                elif payload.get("type") == "update_time_limit":
+    new_limit = int(payload.get("time_limit", 0))
+    # Cập nhật lại turn_time_limit chuẩn cho phòng chơi
+    if room:
+        room[0]["turn_time_limit"] = new_limit
+
+    # Chuyển tiếp thông điệp này cho đối thủ trong phòng
+    outgoing = [(p["ws"], message) for p in clients]
+    turn_start = []
 
             for client, outgoing_message in outgoing:
                 await relay_message(client, outgoing_message)
