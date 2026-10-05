@@ -317,6 +317,23 @@ async def handler(websocket):
                 elif payload.get("type") == "rematch":
                     outgoing = [(p["ws"], message) for p in clients]
                     turn_start = []
+                
+                # === DÁN ĐOẠN CODE NÀY VÀO ĐÂY ===
+                elif payload.get("type") == "timeout":
+                    loser_sym = payload.get("loser")
+                    if room:
+                        room[0]["turn_symbol"] = None
+                        recipients = list(room)
+                        for p in recipients:
+                            await send_json(p["ws"], {
+                                "type": "timeout",
+                                "loser": loser_sym,
+                                "seconds": 0,
+                            })
+                    outgoing = []
+                    turn_start = []
+                # ==================================
+
                 else:
                     outgoing = [(p["ws"], message) for p in clients]
                     turn_start = []
