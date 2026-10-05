@@ -7,7 +7,7 @@ import websockets
 # CARO ONLINE WEBSOCKET SERVER
 # ============================================================
 # Client gửi:
-#   {"action": "join", "room": "1234", "name": "Tùng"}
+#   {"action": "join", "room": "1234", "name": "Tùng", "time_limit": 0}
 # ============================================================
 
 rooms = {}
@@ -15,7 +15,7 @@ rooms_lock = asyncio.Lock()
 
 MAX_NAME_LENGTH = 24
 MAX_ROOM_LENGTH = 32
-TURN_TIME_LIMIT = 35
+DEFAULT_TURN_TIME_LIMIT = 35  # Giá trị dự phòng mặc định nếu client không gửi
 
 def clean_name(name):
     """Làm sạch tên người chơi."""
@@ -139,12 +139,14 @@ async def handler(websocket):
         room_id = clean_room(data.get("room"))
         player_name = clean_name(data.get("name"))
         
-        # === NHẬN THÊM CẤU HÌNH THỜI GIAN TỪ CLIENT ===
+        # === NHẬN CẤU HÌNH THỜI GIAN TỪ CLIENT (Tính bằng giây cho mỗi lượt) ===
         try:
-            client_time_limit = int(data.get("time_limit", 35))
+            # Nếu client truyền time_limit dạng số giây (ví dụ 0 hoặc 60, 120...), lấy giá trị đó.
+            # Nếu không truyền, mặc định lấy 0 (không giới hạn) hoặc thay đổi tùy ý.
+            client_time_limit = int(data.get("time_limit", 0))
         except (ValueError, TypeError):
-            client_time_limit = 35
-        # ===============================================
+            client_time_limit = 0
+        # ===================================================================
 
         if not room_id:
             await send_json(websocket, {
@@ -159,7 +161,7 @@ async def handler(websocket):
             "symbol": None,
             "turn_task": None,
             "turn_symbol": None,
-            "time_limit": client_time_limit, # Lưu thời gian của người tạo phòng
+            "time_limit": client_time_limit,
         }
 
         start_messages = []
@@ -195,8 +197,9 @@ async def handler(websocket):
                 player_o["symbol"] = "O"
                 room[0]["turn_symbol"] = "X"  
                 
-                # Lưu time_limit của người tạo phòng (player_x) làm quy chuẩn cho cả phòng
-                room[0]["turn_time_limit"] = player_x.get("time_limit", 35)
+                # Lấy time_limit của người tạo phòng (player_x) làm quy chuẩn cho cả phòng
+                turn_limit = player_x.get("time_limit", 0)
+                room[0]["turn_time_limit"] = turn_limit
 
                 opponent_joined_messages = [
                     (
@@ -238,11 +241,12 @@ async def handler(websocket):
                     ),
                 ]
 
+                # CHỈ GỬI THÔNG TIN "seconds" NẾU turn_limit > 0
                 turn_start_messages = [
                     (p["ws"], {
                         "type": "turn_start",
                         "symbol": "X",
-                        "seconds": TURN_TIME_LIMIT,
+                        "seconds": turn_limit,
                     }) for p in room
                 ]
 
@@ -258,7 +262,7 @@ async def handler(websocket):
             await send_json(ws, message)
 
         # --------------------------------------------------------
-        # Relay dữ liệu Caro (Chỉ bắt đầu tính giờ từ nước đi đầu tiên)
+        # Relay dữ liệu Caro 
         # --------------------------------------------------------
         async for message in websocket:
             try:
@@ -276,6 +280,7 @@ async def handler(websocket):
                     break
 
                 clients = [p for p in room if p["ws"] is not websocket]
+                turn_limit = room[0].get("turn_time_limit", 0)
 
                 if payload.get("type") == "move":
                     room_turn = room[0].get("turn_symbol") if room else None
@@ -292,10 +297,12 @@ async def handler(websocket):
                     room[0]["turn_task"] = None
 
                     outgoing = [(p["ws"], message) for p in clients]
+                    
+                    # CHỈ GỬI "turn_start" KÈM SỐ GIÂY NẾU THỜI GIAN > 0
                     turn_start = [(p["ws"], {
                         "type": "turn_start",
                         "symbol": next_symbol,
-                        "seconds": TURN_TIME_LIMIT,
+                        "seconds": turn_limit,
                     }) for p in room]
                 elif payload.get("type") == "rematch":
                     outgoing = [(p["ws"], message) for p in clients]
@@ -309,8 +316,7 @@ async def handler(websocket):
             for client, timer_message in turn_start:
                 await send_json(client, timer_message)
 
-            # Tạo timer đếm ngược nếu phòng có bật giới hạn thời gian (turn_limit > 0)
-            turn_limit = room[0].get("turn_time_limit", 35)
+            # CHỈ TẠO TIẾN TRÌNH ĐẾM NGƯỢC (TIMEOUT) NẾU turn_limit > 0
             if payload.get("type") == "move" and room_id and turn_limit > 0:
                 async def timeout_task(expected_symbol):
                     try:
@@ -376,3 +382,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nServer đã dừng.")
+```[cite: 1]
