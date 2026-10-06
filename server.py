@@ -13,17 +13,13 @@ def clean_name(name):
     if not isinstance(name, str):
         return "Người chơi"
     name = " ".join(name.strip().split())
-    if not name:
-        return "Người chơi"
-    return name[:MAX_NAME_LENGTH]
+    return name[:MAX_NAME_LENGTH] if name else "Người chơi"
 
 def clean_room(room):
     if room is None:
         return ""
     room = str(room).strip()
-    if not room:
-        return ""
-    return room[:MAX_ROOM_LENGTH]
+    return room[:MAX_ROOM_LENGTH] if room else ""
 
 async def send_json(websocket, data):
     try:
@@ -37,24 +33,18 @@ async def remove_player(room_id, websocket):
         room = rooms.get(room_id)
         if not room:
             return
-
         player = next((p for p in room if p["ws"] is websocket), None)
         if player is None:
             return
-
         room.remove(player)
-
         task = player.get("turn_task")
         if task and not task.done():
             task.cancel()
-
-        remaining_players = list(room)
-
-        if not remaining_players:
+        remaining = list(room)
+        if not remaining:
             del rooms[room_id]
-
-    for opponent in remaining_players:
-        await send_json(opponent["ws"], {
+    for opp in remaining:
+        await send_json(opp["ws"], {
             "type": "disconnect",
             "msg": "Đối thủ đã thoát hoặc mất mạng.",
         })
@@ -62,16 +52,15 @@ async def remove_player(room_id, websocket):
 async def handler(websocket):
     room_id = None
     player = None
-
     try:
         try:
-            raw_message = await asyncio.wait_for(websocket.recv(), timeout=15)
+            raw = await asyncio.wait_for(websocket.recv(), timeout=15)
         except asyncio.TimeoutError:
             await send_json(websocket, {"type": "error", "msg": "Hết thời gian kết nối phòng."})
             return
 
         try:
-            data = json.loads(raw_message)
+            data = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
             await send_json(websocket, {"type": "error", "msg": "Dữ liệu kết nối không hợp lệ."})
             return
@@ -82,7 +71,6 @@ async def handler(websocket):
 
         room_id = clean_room(data.get("room"))
         player_name = clean_name(data.get("name"))
-
         try:
             client_time_limit = int(data.get("time_limit", 0))
         except (ValueError, TypeError):
@@ -106,7 +94,6 @@ async def handler(websocket):
 
         async with rooms_lock:
             room = rooms.setdefault(room_id, [])
-
             if len(room) >= 2:
                 await send_json(websocket, {"type": "error", "msg": "Phòng đã đầy! Vui lòng chọn mã khác."})
                 return
@@ -120,18 +107,15 @@ async def handler(websocket):
                     "player_name": player_name,
                     "msg": "Đã vào phòng. Đang chờ đối thủ...",
                 }
-            elif len(room) == 2:
-                player_x = room[0]
-                player_o = room[1]
-
+            else:
+                # 2 người
+                player_x, player_o = room[0], room[1]
                 player_x["symbol"] = "X"
                 player_o["symbol"] = "O"
                 room[0]["turn_symbol"] = "X"
-
                 turn_limit = player_x.get("time_limit", 0)
                 room[0]["turn_time_limit"] = turn_limit
 
-                # Hủy task cũ nếu có
                 old_task = room[0].get("turn_task")
                 if old_task and not old_task.done():
                     old_task.cancel()
@@ -153,22 +137,17 @@ async def handler(websocket):
                         "room": room_id,
                     }),
                 ]
-
                 turn_start_messages = [
-                    (p["ws"], {
-                        "type": "turn_start",
-                        "symbol": "X",
-                        "seconds": turn_limit,
-                    }) for p in room
+                    (p["ws"], {"type": "turn_start", "symbol": "X", "seconds": turn_limit})
+                    for p in room
                 ]
 
         if waiting_message:
             await send_json(websocket, waiting_message)
-
-        for ws, message in start_messages:
-            await send_json(ws, message)
-        for ws, message in turn_start_messages:
-            await send_json(ws, message)
+        for ws, msg in start_messages:
+            await send_json(ws, msg)
+        for ws, msg in turn_start_messages:
+            await send_json(ws, msg)
 
         # ==================== RELAY ====================
         async for message in websocket:
@@ -181,47 +160,40 @@ async def handler(websocket):
                 room = rooms.get(room_id)
                 if not room:
                     break
-
                 sender = next((p for p in room if p["ws"] is websocket), None)
-                if sender is None:
+                if not sender:
                     break
 
                 clients = [p for p in room if p["ws"] is not websocket]
                 turn_limit = room[0].get("turn_time_limit", 0)
                 outgoing = []
                 turn_start = []
-
                 msg_type = payload.get("type")
 
                 if msg_type == "move":
-                    # Validate cơ bản
-                    r = payload.get("r")
-                    c = payload.get("c")
+                    r, c = payload.get("r"), payload.get("c")
                     if not isinstance(r, int) or not isinstance(c, int):
                         continue
-                    if not (0 <= r < 20 and 0 <= c < 20):  # hard limit 20x20
+                    if not (0 <= r < 20 and 0 <= c < 20):
                         continue
 
                     room_turn = room[0].get("turn_symbol")
                     if room_turn and sender.get("symbol") != room_turn:
                         continue
 
-                    # Đổi lượt
                     room[0]["turn_symbol"] = "O" if sender.get("symbol") == "X" else "X"
                     next_symbol = room[0]["turn_symbol"]
 
-                    # Hủy timeout cũ
                     old_task = room[0].get("turn_task")
                     if old_task and not old_task.done():
                         old_task.cancel()
                     room[0]["turn_task"] = None
 
                     outgoing = [(p["ws"], message) for p in clients]
-                    turn_start = [(p["ws"], {
-                        "type": "turn_start",
-                        "symbol": next_symbol,
-                        "seconds": turn_limit,
-                    }) for p in room]
+                    turn_start = [
+                        (p["ws"], {"type": "turn_start", "symbol": next_symbol, "seconds": turn_limit})
+                        for p in room
+                    ]
 
                 elif msg_type == "update_time_limit":
                     try:
@@ -232,28 +204,21 @@ async def handler(websocket):
                     outgoing = [(p["ws"], message) for p in clients]
 
                 elif msg_type == "rematch":
-                    # === RESET STATE PHÒNG KHI REMATCH ===
                     old_task = room[0].get("turn_task")
                     if old_task and not old_task.done():
                         old_task.cancel()
                     room[0]["turn_task"] = None
 
-                    # Đổi bên (X <-> O)
+                    # Flip symbol
                     for p in room:
-                        if p["symbol"] == "X":
-                            p["symbol"] = "O"
-                        else:
-                            p["symbol"] = "X"
+                        p["symbol"] = "O" if p["symbol"] == "X" else "X"
+                    room[0]["turn_symbol"] = "X"
 
-                    room[0]["turn_symbol"] = "X"  # X luôn đi trước sau rematch
                     outgoing = [(p["ws"], message) for p in clients]
-
-                    # Gửi lại turn_start sau khi flip
-                    turn_start = [(p["ws"], {
-                        "type": "turn_start",
-                        "symbol": "X",
-                        "seconds": room[0].get("turn_time_limit", 0),
-                    }) for p in room]
+                    turn_start = [
+                        (p["ws"], {"type": "turn_start", "symbol": "X", "seconds": room[0].get("turn_time_limit", 0)})
+                        for p in room
+                    ]
 
                 elif msg_type == "timeout":
                     loser_sym = payload.get("loser")
@@ -262,53 +227,45 @@ async def handler(websocket):
                     if old_task and not old_task.done():
                         old_task.cancel()
                     room[0]["turn_task"] = None
-
                     for p in room:
-                        await send_json(p["ws"], {
-                            "type": "timeout",
-                            "loser": loser_sym,
-                        })
-                    continue  # đã gửi rồi, không cần outgoing
+                        await send_json(p["ws"], {"type": "timeout", "loser": loser_sym})
+                    continue
 
                 else:
                     outgoing = [(p["ws"], message) for p in clients]
 
-            # Gửi ra ngoài lock
-            for client, outgoing_message in outgoing:
-                await send_json(client, outgoing_message)
-            for client, timer_message in turn_start:
-                await send_json(client, timer_message)
+            for client, msg in outgoing:
+                await send_json(client, msg)
+            for client, msg in turn_start:
+                await send_json(client, msg)
 
-            # Tạo timeout task mới nếu cần
+            # Timeout task
             if msg_type == "move" and turn_limit > 0:
                 next_symbol = None
                 async with rooms_lock:
-                    current_room = rooms.get(room_id)
-                    if current_room:
-                        next_symbol = current_room[0].get("turn_symbol")
+                    current = rooms.get(room_id)
+                    if current:
+                        next_symbol = current[0].get("turn_symbol")
 
                 if next_symbol:
-                    async def timeout_task(expected_symbol, limit_seconds):
+                    async def timeout_task(expected, limit):
                         try:
-                            await asyncio.sleep(limit_seconds)
+                            await asyncio.sleep(limit)
                             async with rooms_lock:
-                                current_room = rooms.get(room_id)
-                                if not current_room or current_room[0].get("turn_symbol") != expected_symbol:
+                                current = rooms.get(room_id)
+                                if not current or current[0].get("turn_symbol") != expected:
                                     return
-                                current_room[0]["turn_symbol"] = None
-                                recipients = list(current_room)
+                                current[0]["turn_symbol"] = None
+                                recipients = list(current)
                             for p in recipients:
-                                await send_json(p["ws"], {
-                                    "type": "timeout",
-                                    "loser": expected_symbol,
-                                })
+                                await send_json(p["ws"], {"type": "timeout", "loser": expected})
                         except asyncio.CancelledError:
                             return
 
                     async with rooms_lock:
-                        current_room = rooms.get(room_id)
-                        if current_room:
-                            current_room[0]["turn_task"] = asyncio.create_task(
+                        current = rooms.get(room_id)
+                        if current:
+                            current[0]["turn_task"] = asyncio.create_task(
                                 timeout_task(next_symbol, turn_limit)
                             )
 
@@ -323,20 +280,13 @@ async def handler(websocket):
 async def main():
     port = int(os.environ.get("PORT", 3000))
     print("=" * 55)
-    print("        CARO ONLINE WEBSOCKET SERVER (VØID PATCHED)")
+    print("        CARO ONLINE WEBSOCKET SERVER (VØID FIXED)")
     print("=" * 55)
-    print(f"Server đang chạy tại port: {port}")
-    print("Mỗi phòng tối đa: 2 người")
+    print(f"Port: {port} | Max 2 players/room")
     print("=" * 55)
-
     async with websockets.serve(
-        handler,
-        "0.0.0.0",
-        port,
-        ping_interval=20,
-        ping_timeout=20,
-        close_timeout=5,
-        max_size=1 * 1024 * 1024,
+        handler, "0.0.0.0", port,
+        ping_interval=20, ping_timeout=20, close_timeout=5, max_size=1*1024*1024
     ):
         await asyncio.Future()
 
@@ -344,4 +294,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nServer đã dừng.")
+        print("\nServer stopped.")
