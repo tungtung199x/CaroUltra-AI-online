@@ -82,6 +82,12 @@ async def handler(ws):
         except Exception:
             time_limit = 0
 
+        board_size = data.get("board_size", "20x20")
+        if board_size not in ("15x15", "19x19", "20x20"):
+            board_size = "20x20"
+
+        rule = clean(data.get("rule"), 32, "Tiêu chuẩn")
+
         if not room_id:
             await send(ws, {"type": "error", "msg": "Thiếu mã phòng"})
             return
@@ -104,6 +110,13 @@ async def handler(ws):
 
             # ========== NGƯỜI THỨ 1 ==========
             if len(room) == 1:
+                # Lưu setting của người tạo phòng
+                room_meta = room  # list, nhưng ta lưu meta vào room[0] sau
+                # Tạm lưu trên player object của người 1
+                player["board_size"] = board_size
+                player["rule"] = rule
+                player["time_limit"] = time_limit
+
                 await send(ws, {
                     "type": "waiting",
                     "msg": "Đã vào phòng. Đang chờ đối thủ..."
@@ -112,17 +125,34 @@ async def handler(ws):
 
             # ========== NGƯỜI THỨ 2 → BẮT ĐẦU GAME ==========
             else:
+                # Lấy setting từ người 1 (người tạo phòng) làm chuẩn
+                host = room[0]
+                final_board = host.get("board_size", board_size)
+                final_rule = host.get("rule", rule)
+                final_time = host.get("time_limit", time_limit)
+
+                # Ghi đè bằng setting người 2 nếu người 1 chưa set (fallback)
+                if not host.get("board_size"):
+                    final_board = board_size
+                if not host.get("rule"):
+                    final_rule = rule
+
                 room[0]["symbol"] = "X"
                 room[1]["symbol"] = "O"
                 room[0]["turn"] = "X"
-                room[0]["time_limit"] = time_limit
+                room[0]["time_limit"] = final_time
+                room[0]["board_size"] = final_board
+                room[0]["rule"] = final_rule
 
                 for i, p in enumerate(room):
                     opp = room[1 - i]
                     await send(p["ws"], {
                         "type": "start",
                         "symbol": p["symbol"],
-                        "opponent_name": opp["name"]
+                        "opponent_name": opp["name"],
+                        "board_size": final_board,
+                        "rule": final_rule,
+                        "time_limit": final_time
                     })
                     await send(p["ws"], {
                         "type": "turn_start",
@@ -130,11 +160,11 @@ async def handler(ws):
                     })
 
                 # Khởi tạo timeout nếu có giới hạn thời gian
-                if time_limit > 0:
+                if final_time > 0:
                     if room[0].get("task") and not room[0]["task"].done():
                         room[0]["task"].cancel()
                     room[0]["task"] = asyncio.create_task(
-                        start_timeout(room_id, "X", time_limit)
+                        start_timeout(room_id, "X", final_time)
                     )
 
         # ========== VÒNG LẶP NHẬN MESSAGE (cả 2 người đều chạy xuống đây) ==========
@@ -147,7 +177,28 @@ async def handler(ws):
             async with rooms_lock:
                 room = rooms.get(room_id)
                 if not room or len(room) < 2:
-                    break
+                    # Nếu chỉ 1 người (đang chờ), vẫn cho update setting
+                    if room and len(room) == 1:
+                        t = payload.get("type")
+                        if t == "update_settings":
+                            p0 = room[0]
+                            if "board_size" in payload:
+                                bs = payload["board_size"]
+                                if bs in ("15x15", "19x19", "20x20"):
+                                    p0["board_size"] = bs
+                            if "rule" in payload:
+                                p0["rule"] = clean(payload["rule"], 32, "Tiêu chuẩn")
+                            if "time_limit" in payload:
+                                try:
+                                    p0["time_limit"] = max(0, int(payload["time_limit"]))
+                                except Exception:
+                                    pass
+                        elif t == "update_time_limit":
+                            try:
+                                room[0]["time_limit"] = max(0, int(payload.get("time_limit", 0)))
+                            except Exception:
+                                pass
+                    continue
 
                 sender = next((p for p in room if p["ws"] is ws), None)
                 if not sender:
@@ -232,7 +283,32 @@ async def handler(ws):
                             "loser": payload.get("loser")
                         })
 
-                # ----- CẬP NHẬT THỜI GIAN -----
+                # ----- CẬP NHẬT SETTING (board + rule + time) -----
+                elif t == "update_settings":
+                    # Chỉ cho update khi chưa có nước đi (turn vẫn là X và chưa move)
+                    # Server tin client (client đã khóa UI khi có quân)
+                    if "board_size" in payload:
+                        bs = payload["board_size"]
+                        if bs in ("15x15", "19x19", "20x20"):
+                            room[0]["board_size"] = bs
+                    if "rule" in payload:
+                        room[0]["rule"] = clean(payload["rule"], 32, "Tiêu chuẩn")
+                    if "time_limit" in payload:
+                        try:
+                            room[0]["time_limit"] = max(0, int(payload["time_limit"]))
+                        except Exception:
+                            pass
+
+                    # Broadcast cho đối thủ
+                    for p in others:
+                        await send(p["ws"], {
+                            "type": "update_settings",
+                            "board_size": room[0].get("board_size", "20x20"),
+                            "rule": room[0].get("rule", "Tiêu chuẩn"),
+                            "time_limit": room[0].get("time_limit", 0)
+                        })
+
+                # ----- CẬP NHẬT THỜI GIAN (giữ tương thích cũ) -----
                 elif t == "update_time_limit":
                     try:
                         new_limit = max(0, int(payload.get("time_limit", 0)))
