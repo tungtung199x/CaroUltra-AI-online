@@ -1,10 +1,14 @@
 import asyncio
 import json
 import os
+import time
 import websockets
 
 rooms = {}
 rooms_lock = asyncio.Lock()
+
+# Thời gian mỗi lượt cố định (giây) — phải khớp client
+TURN_SECS = 35
 
 
 def clean(text, max_len=24, default=""):
@@ -33,32 +37,58 @@ async def remove_player(room_id, ws):
 
         room.remove(player)
 
-        if player.get("task") and not player["task"].done():
-            player["task"].cancel()
-
         remaining = list(room)
         if not remaining:
             del rooms[room_id]
             return
 
+        # Hủy timeout nếu còn
+        if remaining[0].get("task") and not remaining[0]["task"].done():
+            try:
+                remaining[0]["task"].cancel()
+            except Exception:
+                pass
+
     for p in remaining:
         await send(p["ws"], {"type": "disconnect", "msg": "Đối thủ đã thoát."})
 
 
-async def start_timeout(room_id, expected_turn, limit):
-    """Tạo task timeout cho lượt hiện tại"""
+async def start_timeout(room_id, expected_turn, turn_secs):
+    """Timeout theo đồng hồ server — chính xác TURN_SECS giây"""
     try:
-        await asyncio.sleep(limit)
+        await asyncio.sleep(turn_secs)
         async with rooms_lock:
             room = rooms.get(room_id)
             if not room or len(room) < 2:
                 return
             if room[0].get("turn") == expected_turn:
                 room[0]["turn"] = None
+                room[0]["turn_deadline"] = None
                 for p in room:
-                    await send(p["ws"], {"type": "timeout", "loser": expected_turn})
+                    await send(p["ws"], {
+                        "type": "timeout",
+                        "loser": expected_turn,
+                        "server_ts": time.time()
+                    })
     except asyncio.CancelledError:
         pass
+
+
+def schedule_turn(room, room_id, turn_symbol, turn_secs=TURN_SECS):
+    """Hủy timeout cũ, set deadline mới, tạo task mới"""
+    if room[0].get("task") and not room[0]["task"].done():
+        room[0]["task"].cancel()
+    room[0]["turn"] = turn_symbol
+    room[0]["turn_deadline"] = time.time() + turn_secs
+    room[0]["turn_secs"] = turn_secs
+    # Chỉ schedule timeout nếu match có bật thời gian (time_limit > 0)
+    if room[0].get("time_limit", 0) > 0:
+        room[0]["task"] = asyncio.create_task(
+            start_timeout(room_id, turn_symbol, turn_secs)
+        )
+    else:
+        room[0]["task"] = None
+        room[0]["turn_deadline"] = None
 
 
 async def handler(ws):
@@ -66,7 +96,6 @@ async def handler(ws):
     player = None
 
     try:
-        # Nhận message join đầu tiên
         raw = await asyncio.wait_for(ws.recv(), timeout=15)
         data = json.loads(raw)
 
@@ -108,11 +137,7 @@ async def handler(ws):
 
             room.append(player)
 
-            # ========== NGƯỜI THỨ 1 ==========
             if len(room) == 1:
-                # Lưu setting của người tạo phòng
-                room_meta = room  # list, nhưng ta lưu meta vào room[0] sau
-                # Tạm lưu trên player object của người 1
                 player["board_size"] = board_size
                 player["rule"] = rule
                 player["time_limit"] = time_limit
@@ -121,17 +146,13 @@ async def handler(ws):
                     "type": "waiting",
                     "msg": "Đã vào phòng. Đang chờ đối thủ..."
                 })
-                # KHÔNG return → giữ connection sống
 
-            # ========== NGƯỜI THỨ 2 → BẮT ĐẦU GAME ==========
             else:
-                # Lấy setting từ người 1 (người tạo phòng) làm chuẩn
                 host = room[0]
                 final_board = host.get("board_size", board_size)
                 final_rule = host.get("rule", rule)
                 final_time = host.get("time_limit", time_limit)
 
-                # Ghi đè bằng setting người 2 nếu người 1 chưa set (fallback)
                 if not host.get("board_size"):
                     final_board = board_size
                 if not host.get("rule"):
@@ -139,7 +160,6 @@ async def handler(ws):
 
                 room[0]["symbol"] = "X"
                 room[1]["symbol"] = "O"
-                room[0]["turn"] = "X"
                 room[0]["time_limit"] = final_time
                 room[0]["board_size"] = final_board
                 room[0]["rule"] = final_rule
@@ -152,22 +172,23 @@ async def handler(ws):
                         "opponent_name": opp["name"],
                         "board_size": final_board,
                         "rule": final_rule,
-                        "time_limit": final_time
+                        "time_limit": final_time,
+                        "turn_secs": TURN_SECS
                     })
+
+                room[0]["turn"] = "X"
+                room[0]["turn_deadline"] = None
+                room[0]["task"] = None
+
+                for p in room:
                     await send(p["ws"], {
                         "type": "turn_start",
-                        "symbol": "X"
+                        "symbol": "X",
+                        "turn_secs": TURN_SECS,
+                        "deadline": None,
+                        "server_ts": time.time()
                     })
 
-                # Khởi tạo timeout nếu có giới hạn thời gian
-                if final_time > 0:
-                    if room[0].get("task") and not room[0]["task"].done():
-                        room[0]["task"].cancel()
-                    room[0]["task"] = asyncio.create_task(
-                        start_timeout(room_id, "X", final_time)
-                    )
-
-        # ========== VÒNG LẶP NHẬN MESSAGE (cả 2 người đều chạy xuống đây) ==========
         async for msg in ws:
             try:
                 payload = json.loads(msg)
@@ -176,26 +197,22 @@ async def handler(ws):
 
             async with rooms_lock:
                 room = rooms.get(room_id)
-                if not room or len(room) < 2:
-                    # Nếu chỉ 1 người (đang chờ), vẫn cho update setting
-                    if room and len(room) == 1:
-                        t = payload.get("type")
-                        if t == "update_settings":
-                            p0 = room[0]
-                            if "board_size" in payload:
-                                bs = payload["board_size"]
-                                if bs in ("15x15", "19x19", "20x20"):
-                                    p0["board_size"] = bs
-                            if "rule" in payload:
-                                p0["rule"] = clean(payload["rule"], 32, "Tiêu chuẩn")
-                            if "time_limit" in payload:
-                                try:
-                                    p0["time_limit"] = max(0, int(payload["time_limit"]))
-                                except Exception:
-                                    pass
-                        elif t == "update_time_limit":
+                if not room:
+                    break
+
+                if len(room) < 2:
+                    t = payload.get("type")
+                    if t in ("update_settings", "update_time_limit"):
+                        p0 = room[0]
+                        if "board_size" in payload:
+                            bs = payload["board_size"]
+                            if bs in ("15x15", "19x19", "20x20"):
+                                p0["board_size"] = bs
+                        if "rule" in payload:
+                            p0["rule"] = clean(payload["rule"], 32, "Tiêu chuẩn")
+                        if "time_limit" in payload:
                             try:
-                                room[0]["time_limit"] = max(0, int(payload.get("time_limit", 0)))
+                                p0["time_limit"] = max(0, int(payload["time_limit"]))
                             except Exception:
                                 pass
                     continue
@@ -207,7 +224,6 @@ async def handler(ws):
                 t = payload.get("type")
                 others = [p for p in room if p["ws"] is not ws]
 
-                # ----- MOVE -----
                 if t == "move":
                     r = payload.get("r")
                     c = payload.get("c")
@@ -219,74 +235,60 @@ async def handler(ws):
                     if current_turn != sender["symbol"]:
                         continue
 
-                    # Đổi lượt
                     next_turn = "O" if sender["symbol"] == "X" else "X"
-                    room[0]["turn"] = next_turn
 
-                    # Hủy timeout cũ
-                    if room[0].get("task") and not room[0]["task"].done():
-                        room[0]["task"].cancel()
+                    schedule_turn(room, room_id, next_turn, TURN_SECS)
+                    deadline = room[0].get("turn_deadline")
+                    server_ts = time.time()
 
-                    # Gửi move cho đối thủ
                     for p in others:
                         await send(p["ws"], payload)
 
-                    # Gửi turn_start cho cả 2
                     for p in room:
-                        await send(p["ws"], {"type": "turn_start", "symbol": next_turn})
+                        await send(p["ws"], {
+                            "type": "turn_start",
+                            "symbol": next_turn,
+                            "turn_secs": TURN_SECS,
+                            "deadline": deadline,
+                            "server_ts": server_ts
+                        })
 
-                    # Tạo timeout mới
-                    limit = room[0].get("time_limit", 0)
-                    if limit > 0:
-                        room[0]["task"] = asyncio.create_task(
-                            start_timeout(room_id, next_turn, limit)
-                        )
-
-                # ----- REMATCH -----
                 elif t == "rematch":
                     if room[0].get("task") and not room[0]["task"].done():
                         room[0]["task"].cancel()
 
-                    # Đảo quân
                     for p in room:
                         p["symbol"] = "O" if p["symbol"] == "X" else "X"
 
                     room[0]["turn"] = "X"
+                    room[0]["turn_deadline"] = None
+                    room[0]["task"] = None
 
-                    # Báo rematch cho đối thủ
                     for p in others:
                         await send(p["ws"], payload)
 
-                    # Gửi lại turn_start
                     for p in room:
                         await send(p["ws"], {
                             "type": "turn_start",
-                            "symbol": "X"
+                            "symbol": "X",
+                            "turn_secs": TURN_SECS,
+                            "deadline": None,
+                            "server_ts": time.time()
                         })
 
-                    # Timeout mới nếu có
-                    limit = room[0].get("time_limit", 0)
-                    if limit > 0:
-                        room[0]["task"] = asyncio.create_task(
-                            start_timeout(room_id, "X", limit)
-                        )
-
-                # ----- TIMEOUT từ client -----
                 elif t == "timeout":
                     if room[0].get("task") and not room[0]["task"].done():
                         room[0]["task"].cancel()
-
                     room[0]["turn"] = None
+                    room[0]["turn_deadline"] = None
                     for p in room:
                         await send(p["ws"], {
                             "type": "timeout",
-                            "loser": payload.get("loser")
+                            "loser": payload.get("loser"),
+                            "server_ts": time.time()
                         })
 
-                # ----- CẬP NHẬT SETTING (board + rule + time) -----
                 elif t == "update_settings":
-                    # Chỉ cho update khi chưa có nước đi (turn vẫn là X và chưa move)
-                    # Server tin client (client đã khóa UI khi có quân)
                     if "board_size" in payload:
                         bs = payload["board_size"]
                         if bs in ("15x15", "19x19", "20x20"):
@@ -299,7 +301,6 @@ async def handler(ws):
                         except Exception:
                             pass
 
-                    # Broadcast cho đối thủ
                     for p in others:
                         await send(p["ws"], {
                             "type": "update_settings",
@@ -308,18 +309,15 @@ async def handler(ws):
                             "time_limit": room[0].get("time_limit", 0)
                         })
 
-                # ----- CẬP NHẬT THỜI GIAN (giữ tương thích cũ) -----
                 elif t == "update_time_limit":
                     try:
                         new_limit = max(0, int(payload.get("time_limit", 0)))
                         room[0]["time_limit"] = new_limit
                     except Exception:
                         pass
-
                     for p in others:
                         await send(p["ws"], payload)
 
-                # ----- Các message khác (nếu có) -----
                 else:
                     for p in others:
                         await send(p["ws"], payload)
@@ -333,7 +331,7 @@ async def handler(ws):
 
 async def main():
     port = int(os.environ.get("PORT", 3000))
-    print(f"Caro Ultra Server đang chạy trên port {port}")
+    print(f"Caro Ultra Server đang chạy trên port {port} | TURN_SECS={TURN_SECS}")
     async with websockets.serve(
         handler,
         "0.0.0.0",
@@ -341,7 +339,7 @@ async def main():
         ping_interval=20,
         ping_timeout=20
     ):
-        await asyncio.Future()  # chạy mãi mãi
+        await asyncio.Future()
 
 
 if __name__ == "__main__":
