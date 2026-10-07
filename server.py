@@ -413,6 +413,8 @@ async def handler(ws):
                         await send(p["ws"], resp)
 
                 elif t == "update_time_limit":
+                    # Tương thích với client cũ: dù dùng message riêng, vẫn cập nhật
+                    # state chung và broadcast lại cho toàn bộ phòng ngay lập tức.
                     try:
                         new_limit = max(0, int(payload.get("time_limit", 0)))
                         room[0]["time_limit"] = new_limit
@@ -420,8 +422,16 @@ async def handler(ws):
                             room[0]["match_times"] = {"X": new_limit, "O": new_limit}
                     except Exception:
                         pass
-                    for p in others:
-                        await send(p["ws"], payload)
+                    for p in room:
+                        await send(p["ws"], {
+                            "type": "update_settings",
+                            "board_size": room[0].get("board_size", "20x20"),
+                            "rule": room[0].get("rule", "Tiêu chuẩn"),
+                            "time_limit": room[0].get("time_limit", 0),
+                            "auto_rotate": room[0].get("auto_rotate", True),
+                            "symbol": p.get("symbol", "X"),
+                            "times": dict(room[0].get("match_times", {"X": 0, "O": 0}))
+                        })
 
                 else:
                     for p in others:
