@@ -24,6 +24,11 @@ async def send(ws, data):
         pass
 
 
+async def send_message(ws, msg_key, fallback_vi=""):
+    """Gửi message theo translation key; fallback giữ tương thích client cũ."""
+    await send(ws, {"msg_key": msg_key, "msg": fallback_vi})
+
+
 async def remove_player(room_id, ws):
     async with rooms_lock:
         room = rooms.get(room_id)
@@ -43,7 +48,7 @@ async def remove_player(room_id, ws):
             except Exception:
                 pass
     for p in remaining:
-        await send(p["ws"], {"type": "disconnect", "msg": "Đối thủ đã thoát."})
+        await send(p["ws"], {"type": "disconnect", "msg_key": "online_opp_left", "msg": "Đối thủ đã thoát."})
 
 
 def get_match_times(room0):
@@ -124,7 +129,7 @@ async def handler(ws):
         data = json.loads(raw)
 
         if data.get("action") != "join":
-            await send(ws, {"type": "error", "msg": "Yêu cầu không hợp lệ"})
+            await send(ws, {"type": "error", "msg_key": "online_invalid_request", "msg": "Yêu cầu không hợp lệ"})
             return
 
         room_id = clean(data.get("room"), 32)
@@ -146,7 +151,7 @@ async def handler(ws):
             req_symbol = "X"
 
         if not room_id:
-            await send(ws, {"type": "error", "msg": "Thiếu mã phòng"})
+            await send(ws, {"type": "error", "msg_key": "online_need_room", "msg": "Thiếu mã phòng"})
             return
 
         # --- Gán symbol thay vì None ---
@@ -171,7 +176,7 @@ async def handler(ws):
                         pass
                     room.remove(old_duplicate)
                 else:
-                    await send(ws, {"type": "error", "msg": "Phòng đã đầy"})
+                    await send(ws, {"type": "error", "msg_key": "online_room_full", "msg": "Phòng đã đầy"})
                     return
 
             room.append(player)
@@ -181,7 +186,7 @@ async def handler(ws):
                 player["rule"] = rule
                 player["time_limit"] = time_limit
                 player["auto_rotate"] = True
-                await send(ws, {"type": "waiting", "msg": "Đã vào phòng. Đang chờ đối thủ..."})
+                await send(ws, {"type": "waiting", "msg_key": "online_waiting", "msg": "Đã vào phòng. Đang chờ đối thủ..."})
             else:
                 host = room[0]
                 final_board = host.get("board_size") or board_size
