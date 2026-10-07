@@ -154,10 +154,15 @@ async def handler(ws):
 
         async with rooms_lock:
             room = rooms.setdefault(room_id, [])
+            
+            # ĐÃ THÊM: Tự động quét và dọn dẹp các kết nối cũ đã đóng trước khi đếm người
+            for p in list(room):
+                if p["ws"].closed:
+                    room.remove(p)
+                    
             if len(room) >= 2:
                 await send(ws, {"type": "error", "msg": "Phòng đã đầy"})
                 return
-
             room.append(player)
 
             if len(room) == 1:
