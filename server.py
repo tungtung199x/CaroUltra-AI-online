@@ -432,10 +432,9 @@ async def handler(ws):
                         if "rule" in payload:
                             sender["rule"] = clean(payload["rule"], 32, "Tiêu chuẩn")
                         if "time_limit" in payload:
-                            try:
-                                sender["time_limit"] = max(0, int(payload["time_limit"]))
-                            except (TypeError, ValueError):
-                                pass
+                            sender["time_limit"] = parse_time_limit(
+                                payload["time_limit"], sender.get("time_limit", 0)
+                            )
                         if "auto_rotate" in payload:
                             sender["auto_rotate"] = bool(payload["auto_rotate"])
                         if payload.get("symbol") in ("X", "O"):
@@ -552,6 +551,11 @@ async def handler(ws):
                         }) for p in room)
 
                     elif t == "rematch":
+                        # Rematch is valid only after the current game has ended.
+                        # The client normally hides the button earlier, but the
+                        # server must remain authoritative against stale/malicious packets.
+                        if not state.get("game_over"):
+                            continue
                         sender["rematch_ready"] = True
                         # Báo ngay cho cả phòng biết một người đã READY.
                         # Trước đây server chỉ gửi khi cả hai cùng READY, khiến
@@ -596,7 +600,7 @@ async def handler(ws):
                         has_moves = bool(state.get("board")) and any(
                             any(cell != "" for cell in row) for row in state["board"]
                         )
-                        if not has_moves:
+                        if state.get("game_over") or not has_moves:
                             new_sym = payload.get("symbol")
                             if new_sym not in ("X", "O"):
                                 continue
@@ -613,7 +617,7 @@ async def handler(ws):
                             }))
 
                     elif t in ("update_settings", "update_time_limit"):
-                        # Settings are only applied safely before the first move.
+                        # Settings are applied before the first move or immediately after game over.
                         has_moves = bool(state.get("board")) and any(
                             any(cell != "" for cell in row) for row in state["board"]
                         )
@@ -640,7 +644,7 @@ async def handler(ws):
                         if "auto_rotate" in payload:
                             state["auto_rotate"] = bool(payload["auto_rotate"])
                         # Symbol selection is locked once the first move exists.
-                        if not has_moves and payload.get("symbol") in ("X", "O"):
+                        if (state.get("game_over") or not has_moves) and payload.get("symbol") in ("X", "O"):
                             sender["symbol"] = payload["symbol"]
                             for p in others:
                                 p["symbol"] = opponent(sender["symbol"])
