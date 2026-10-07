@@ -150,7 +150,7 @@ async def handler(ws):
             return
 
         # --- Gán symbol thay vì None ---
-        player = {"ws": ws, "name": name, "symbol": req_symbol, "task": None}
+        player = {"ws": ws, "name": name, "symbol": req_symbol, "task": None, "rematch_ready": False}
 
         async with rooms_lock:
             room = rooms.setdefault(room_id, [])
@@ -180,6 +180,7 @@ async def handler(ws):
                 player["board_size"] = board_size
                 player["rule"] = rule
                 player["time_limit"] = time_limit
+                player["auto_rotate"] = True
                 await send(ws, {"type": "waiting", "msg": "Đã vào phòng. Đang chờ đối thủ..."})
             else:
                 host = room[0]
@@ -206,6 +207,9 @@ async def handler(ws):
                 room[0]["turn"] = "X"
                 room[0]["turn_deadline"] = None
                 room[0]["task"] = None
+                room[0]["auto_rotate"] = bool(room[0].get("auto_rotate", True))
+                for p in room:
+                    p["rematch_ready"] = False
 
                 for i, p in enumerate(room):
                     opp = room[1 - i]
@@ -216,6 +220,7 @@ async def handler(ws):
                         "board_size": final_board,
                         "rule": final_rule,
                         "time_limit": final_time,
+                        "auto_rotate": room[0].get("auto_rotate", True),
                         "turn_secs": TURN_SECS,
                         "times": {"X": final_time, "O": final_time}
                     })
@@ -254,6 +259,8 @@ async def handler(ws):
                                 p0["time_limit"] = max(0, int(payload["time_limit"]))
                             except Exception:
                                 pass
+                        if "auto_rotate" in payload:
+                            p0["auto_rotate"] = bool(payload["auto_rotate"])
                         # Cập nhật quân cờ khi ở sảnh chờ 1 mình
                         if "symbol" in payload and payload["symbol"] in ("X", "O"):
                             p0["symbol"] = payload["symbol"]
@@ -297,31 +304,51 @@ async def handler(ws):
                         })
 
                 elif t == "rematch":
-                    if room[0].get("task") and not room[0]["task"].done():
-                        room[0]["task"].cancel()
-                        
-                    # --- Áp dụng quân cờ từ Client khi rematch ---
+                    # Chỉ ghi nhận người chơi đã sẵn sàng. Không bắt đầu ngay.
+                    # Khi cả 2 cùng sẵn sàng, server mới chốt quân và phát lệnh rematch.
+                    sender["rematch_ready"] = True
+
                     req_sym = payload.get("symbol")
                     if req_sym in ("X", "O"):
                         sender["symbol"] = req_sym
+                        # Nếu người chơi chủ động chọn quân, đối thủ luôn nhận quân ngược lại.
                         for p in others:
                             p["symbol"] = "O" if req_sym == "X" else "X"
-                    else:
+
+                    if not all(p.get("rematch_ready", False) for p in room):
+                        continue
+
+                    # Cả hai đã sẵn sàng -> chốt quân cho ván mới.
+                    # auto_rotate=True: mỗi người đổi X <-> O.
+                    # auto_rotate=False: giữ nguyên quân hiện tại.
+                    if room[0].get("auto_rotate", True):
                         for p in room:
                             p["symbol"] = "O" if p["symbol"] == "X" else "X"
-                            
+
+                    if room[0].get("task") and not room[0]["task"].done():
+                        room[0]["task"].cancel()
+
                     limit = room[0].get("time_limit", 0)
                     room[0]["match_times"] = {"X": limit, "O": limit}
                     room[0]["turn"] = "X"
                     room[0]["turn_deadline"] = None
                     room[0]["task"] = None
 
-                    for p in others:
-                        await send(p["ws"], payload)
+                    for p in room:
+                        p["rematch_ready"] = False
+
+                    # Gửi cho từng client chính quân mà client đó sẽ dùng.
+                    for p in room:
+                        await send(p["ws"], {
+                            "type": "rematch",
+                            "symbol": p["symbol"],
+                            "auto_rotate": room[0].get("auto_rotate", True)
+                        })
+
                     for p in room:
                         await send(p["ws"], {
                             "type": "turn_start",
-                            "symbol": "X", # Quân X luôn đi trước
+                            "symbol": "X",
                             "turn_secs": TURN_SECS,
                             "deadline": None,
                             "times": {"X": limit, "O": limit},
