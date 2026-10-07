@@ -349,41 +349,42 @@ async def handler(ws):
                         })
 
                 elif t == "update_settings":
-                    if "board_size" in payload:
-                        bs = payload["board_size"]
-                        if bs in ("15x15", "19x19", "20x20"):
-                            room[0]["board_size"] = bs
-                    if "rule" in payload:
-                        room[0]["rule"] = clean(payload["rule"], 32, "Tiêu chuẩn")
-                    if "time_limit" in payload:
-                        try:
-                            new_limit = max(0, int(payload["time_limit"]))
-                            room[0]["time_limit"] = new_limit
-                            # Reset match times nếu chưa có nước
-                            if room[0].get("turn_deadline") is None:
-                                room[0]["match_times"] = {"X": new_limit, "O": new_limit}
-                        except Exception:
-                            pass
-                            
-                    # --- Bổ sung xử lý lật quân cờ ---
-                    if "symbol" in payload:
-                        new_sym = payload["symbol"]
-                        if new_sym in ("X", "O"):
-                            sender["symbol"] = new_sym
-                            for p in others:
-                                p["symbol"] = "O" if new_sym == "X" else "X"
-                                
-                    for p in others:
-                        resp = {
-                            "type": "update_settings",
-                            "board_size": room[0].get("board_size", "20x20"),
-                            "rule": room[0].get("rule", "Tiêu chuẩn"),
-                            "time_limit": room[0].get("time_limit", 0),
-                            "times": dict(room[0].get("match_times", {"X": 0, "O": 0}))
-                        }
-                        if "symbol" in payload:
-                            resp["symbol"] = payload["symbol"]
-                        await send(p["ws"], resp)
+    if "board_size" in payload:
+        bs = payload["board_size"]
+        if bs in ("15x15", "19x19", "20x20"):
+            room[0]["board_size"] = bs
+    if "rule" in payload:
+        room[0]["rule"] = clean(payload["rule"], 32, "Tiêu chuẩn")
+    if "time_limit" in payload:
+        try:
+            new_limit = max(0, int(payload["time_limit"]))
+            room[0]["time_limit"] = new_limit
+        except Exception:
+            pass
+            
+    # --- Bổ sung đồng bộ trạng thái Tự động (auto_rotate) ---
+    if "auto_rotate" in payload:
+        room[0]["auto_rotate"] = bool(payload["auto_rotate"])
+
+    if "symbol" in payload:
+        new_sym = payload["symbol"]
+        if new_sym in ("X", "O"):
+            sender["symbol"] = new_sym
+            for p in others:
+                p["symbol"] = "O" if new_sym == "X" else "X"
+                
+    for p in others:
+        resp = {
+            "type": "update_settings",
+            "board_size": room[0].get("board_size", "20x20"),
+            "rule": room[0].get("rule", "Tiêu chuẩn"),
+            "time_limit": room[0].get("time_limit", 0),
+            "auto_rotate": room[0].get("auto_rotate", True), # Gửi kèm trạng thái tự động
+            "times": dict(room[0].get("match_times", {"X": 0, "O": 0}))
+        }
+        if "symbol" in payload:
+            resp["symbol"] = payload["symbol"]
+        await send(p["ws"], resp)
 
                 elif t == "update_time_limit":
                     try:
