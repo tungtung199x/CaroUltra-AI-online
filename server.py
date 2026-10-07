@@ -124,4 +124,4 @@ async def handler(ws):
         data = json.loads(raw)
 
         if data.get("action") != "join":
-            await send(ws, {"type": "error", "msg": "Yêu cầu không hợp lệ
+            await send(ws, {"type": "error", "msg": "Yêu cầu không hợp lệ"})
