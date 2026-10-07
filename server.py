@@ -246,6 +246,21 @@ async def handler(ws):
 
                 if len(room) < 2:
                     t = payload.get("type")
+                    if t == "symbol_update":
+                        p0 = room[0]
+                        new_sym = payload.get("symbol")
+                        if new_sym in ("X", "O"):
+                            p0["symbol"] = new_sym
+                        if "auto_rotate" in payload:
+                            p0["auto_rotate"] = bool(payload["auto_rotate"])
+                        own = p0.get("symbol", "X")
+                        await send(p0["ws"], {
+                            "type": "symbol_update",
+                            "symbol": own,
+                            "opponent_symbol": "O" if own == "X" else "X",
+                            "auto_rotate": bool(p0.get("auto_rotate", True))
+                        })
+                        continue
                     if t in ("update_settings", "update_time_limit"):
                         p0 = room[0]
                         if "board_size" in payload:
@@ -264,6 +279,25 @@ async def handler(ws):
                         # Cập nhật quân cờ khi ở sảnh chờ 1 mình
                         if "symbol" in payload and payload["symbol"] in ("X", "O"):
                             p0["symbol"] = payload["symbol"]
+                        # Xác nhận lại trạng thái cho chính người đang chờ để client
+                        # luôn có cùng nguồn dữ liệu với server ngay cả trước khi đối thủ vào.
+                        own = p0.get("symbol", "X")
+                        await send(p0["ws"], {
+                            "type": "symbol_update",
+                            "symbol": own,
+                            "opponent_symbol": "O" if own == "X" else "X",
+                            "auto_rotate": bool(p0.get("auto_rotate", True))
+                        })
+                        await send(p0["ws"], {
+                            "type": "update_settings",
+                            "board_size": p0.get("board_size", "20x20"),
+                            "rule": p0.get("rule", "Tiêu chuẩn"),
+                            "time_limit": p0.get("time_limit", 0),
+                            "auto_rotate": bool(p0.get("auto_rotate", True)),
+                            "symbol": own,
+                            "opponent_symbol": "O" if own == "X" else "X",
+                            "times": dict(p0.get("match_times", {"X": 0, "O": 0}))
+                        })
                     continue
 
                 sender = next((p for p in room if p["ws"] is ws), None)
@@ -372,6 +406,30 @@ async def handler(ws):
                             "server_ts": time.time()
                         })
 
+                elif t == "symbol_update":
+                    # Phe là trạng thái riêng cần phản ánh NGAY, kể cả khi ván đã kết thúc.
+                    new_sym = payload.get("symbol")
+                    if new_sym not in ("X", "O"):
+                        continue
+                    # Người gửi chọn quân mới; server luôn ép người còn lại là quân đối nghịch.
+                    # Như vậy không thể xảy ra trạng thái cả hai cùng X hoặc cùng O.
+                    sender["symbol"] = new_sym
+                    for p in room:
+                        if p is not sender:
+                            p["symbol"] = "O" if new_sym == "X" else "X"
+                    if "auto_rotate" in payload:
+                        room[0]["auto_rotate"] = bool(payload["auto_rotate"])
+                    for p in room:
+                        own_symbol = p["symbol"]
+                        opponent_symbol = "O" if own_symbol == "X" else "X"
+                        await send(p["ws"], {
+                            "type": "symbol_update",
+                            # symbol = quân của CHÍNH client nhận message
+                            "symbol": own_symbol,
+                            "opponent_symbol": opponent_symbol,
+                            "auto_rotate": room[0].get("auto_rotate", False)
+                        })
+
                 elif t == "update_settings":
                     if "board_size" in payload:
                         bs = payload["board_size"]
@@ -431,6 +489,7 @@ async def handler(ws):
                             "time_limit": room[0].get("time_limit", 0),
                             "auto_rotate": room[0].get("auto_rotate", True),
                             "symbol": p.get("symbol", "X"),
+                            "opponent_symbol": "O" if p.get("symbol", "X") == "X" else "X",
                             "times": dict(room[0].get("match_times", {"X": 0, "O": 0}))
                         })
 
@@ -447,7 +506,7 @@ async def handler(ws):
 
 async def main():
     port = int(os.environ.get("PORT", 3000))
-    print(f"Caro Ultra Server port {port} | TURN_SECS={TURN_SECS}")
+    print(f"XOUltra-AI Server port {port} | TURN_SECS={TURN_SECS}")
     async with websockets.serve(handler, "0.0.0.0", port, ping_interval=20, ping_timeout=20):
         await asyncio.Future()
 
