@@ -396,21 +396,23 @@ async def handler(ws):
                     if "symbol" in payload:
                         new_sym = payload["symbol"]
                         if new_sym in ("X", "O"):
+                            # Server chốt cặp quân cho cả phòng.
                             sender["symbol"] = new_sym
                             for p in others:
                                 p["symbol"] = "O" if new_sym == "X" else "X"
-                                
-                    for p in others:
+
+                    # Gửi cho TẤT CẢ client trạng thái cuối cùng của chính họ.
+                    # Như vậy mỗi máy luôn hiển thị đúng X/O/🔄 mà server đã chốt.
+                    for p in room:
                         resp = {
                             "type": "update_settings",
                             "board_size": room[0].get("board_size", "20x20"),
                             "rule": room[0].get("rule", "Tiêu chuẩn"),
                             "time_limit": room[0].get("time_limit", 0),
-                            "auto_rotate": room[0].get("auto_rotate", True), # Gửi kèm trạng thái tự động
-                            "times": dict(room[0].get("match_times", {"X": 0, "O": 0}))
+                            "auto_rotate": room[0].get("auto_rotate", True),
+                            "times": dict(room[0].get("match_times", {"X": 0, "O": 0})),
+                            "symbol": p["symbol"]
                         }
-                        if "symbol" in payload:
-                            resp["symbol"] = payload["symbol"]
                         await send(p["ws"], resp)
 
                 elif t == "update_time_limit":
