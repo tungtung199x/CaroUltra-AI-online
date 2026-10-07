@@ -2,12 +2,16 @@ import asyncio
 import json
 import os
 import time
+from contextlib import suppress
+
 import websockets
 
 rooms = {}
 rooms_lock = asyncio.Lock()
 
 TURN_SECS = 35
+VALID_BOARDS = {"15x15": 15, "20x20": 20}
+MAX_MESSAGE_BYTES = 64 * 1024
 
 
 def clean(text, max_len=24, default=""):
@@ -17,19 +21,207 @@ def clean(text, max_len=24, default=""):
     return text[:max_len] if text else default
 
 
-async def send(ws, data):
+def board_dimension(board_size):
+    return VALID_BOARDS.get(board_size, 20)
+
+
+def valid_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def opponent(symbol):
+    return "O" if symbol == "X" else "X"
+
+
+def room_state(room):
+    return room[0] if room else None
+
+
+def current_match_times(state, now=None):
+    """Return display-safe integer match clocks without mutating room state."""
+    now = time.time() if now is None else now
+    remaining = dict(state.get("match_remaining", {"X": 0.0, "O": 0.0}))
+    turn = state.get("turn")
+    deadline = state.get("turn_deadline")
+    if turn in ("X", "O") and deadline and state.get("time_limit", 0) > 0:
+        # The turn deadline may be shorter than the total-match remaining time.
+        # Only the active side's clock is running.
+        active_left = max(0.0, deadline - now)
+        turn_started = state.get("turn_started_at")
+        if turn_started is not None:
+            spent = max(0.0, now - float(turn_started))
+        else:
+            turn_secs = state.get("turn_secs", TURN_SECS)
+            spent = max(0.0, turn_secs - active_left)
+        remaining[turn] = max(0.0, remaining.get(turn, 0.0) - spent)
+    return {"X": max(0, int(remaining.get("X", 0.0))),
+            "O": max(0, int(remaining.get("O", 0.0)))}
+
+
+def consume_active_turn(state, now=None):
+    """Commit elapsed time for the current turn into precise match clocks."""
+    now = time.time() if now is None else now
+    turn = state.get("turn")
+    deadline = state.get("turn_deadline")
+    if turn not in ("X", "O") or not deadline or state.get("time_limit", 0) <= 0:
+        return
+    turn_secs = float(state.get("turn_secs", TURN_SECS))
+    turn_started = state.get("turn_started_at")
+    if turn_started is not None:
+        spent = min(turn_secs, max(0.0, now - float(turn_started)))
+    else:
+        active_left = max(0.0, deadline - now)
+        spent = min(turn_secs, max(0.0, turn_secs - active_left))
+    remaining = state.setdefault("match_remaining", {"X": 0.0, "O": 0.0})
+    remaining[turn] = max(0.0, float(remaining.get(turn, 0.0)) - spent)
+
+
+def cancel_turn_task(state):
+    task = state.get("task")
+    if task and not task.done():
+        task.cancel()
+    state["task"] = None
+
+
+def check_win(board, r, c, piece, rule):
+    """Mirror the client's get_winning_line() logic for server authority."""
+    n = len(board)
+    rule_l = str(rule or "").lower()
+    for dr, dc in ((0, 1), (1, 0), (1, 1), (1, -1)):
+        cells = [(r, c)]
+        blocked_pos = blocked_neg = False
+
+        nr, nc = r + dr, c + dc
+        while 0 <= nr < n and 0 <= nc < n:
+            if board[nr][nc] == piece:
+                cells.append((nr, nc))
+                nr += dr
+                nc += dc
+            else:
+                blocked_pos = board[nr][nc] != ""
+                break
+        else:
+            blocked_pos = True
+
+        nr, nc = r - dr, c - dc
+        while 0 <= nr < n and 0 <= nc < n:
+            if board[nr][nc] == piece:
+                cells.insert(0, (nr, nc))
+                nr -= dr
+                nc -= dc
+            else:
+                blocked_neg = board[nr][nc] != ""
+                break
+        else:
+            blocked_neg = True
+
+        if len(cells) >= 5:
+            if "standard" in rule_l or "tiêu chuẩn" in rule_l:
+                return cells
+            if ("chặn 2 đầu" in rule_l or "block" in rule_l) and blocked_pos and blocked_neg:
+                continue
+            return cells
+    return []
+
+
+def make_board(size):
+    return [["" for _ in range(size)] for _ in range(size)]
+
+
+async def safe_send(ws, data):
     try:
-        await ws.send(json.dumps(data, ensure_ascii=False))
+        await ws.send(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+        return True
     except Exception:
+        return False
+
+
+async def send_many(items):
+    """Network I/O happens outside rooms_lock and in parallel."""
+    if not items:
+        return
+    await asyncio.gather(*(safe_send(ws, data) for ws, data in items), return_exceptions=True)
+
+
+async def start_timeout(room_id, expected_turn, expected_deadline):
+    """Server-authoritative timeout. Client timeout packets can never force a loss."""
+    try:
+        delay = max(0.0, expected_deadline - time.time())
+        await asyncio.sleep(delay)
+        outbound = []
+        async with rooms_lock:
+            room = rooms.get(room_id)
+            if not room or len(room) < 2:
+                return
+            state = room_state(room)
+            if (state.get("turn") != expected_turn or
+                    state.get("turn_deadline") != expected_deadline or
+                    state.get("game_over")):
+                return
+
+            now = time.time()
+            consume_active_turn(state, now)
+            state["turn"] = None
+            state["turn_deadline"] = None
+            state["turn_started_at"] = None
+            cancel_turn_task(state)
+            state["game_over"] = True
+            state["winner"] = opponent(expected_turn)
+            times = current_match_times(state, now)
+            payload = {
+                "type": "timeout",
+                "loser": expected_turn,
+                "times": times,
+                "server_ts": now,
+            }
+            outbound = [(p["ws"], payload) for p in room]
+        await send_many(outbound)
+    except asyncio.CancelledError:
         pass
 
 
-async def send_message(ws, msg_key, fallback_vi=""):
-    """Gửi message theo translation key; fallback giữ tương thích client cũ."""
-    await send(ws, {"msg_key": msg_key, "msg": fallback_vi})
+def schedule_turn_locked(room, room_id, turn_symbol, turn_secs=TURN_SECS):
+    """Update turn state. Caller MUST hold rooms_lock."""
+    state = room_state(room)
+    now = time.time()
+    old_turn = state.get("turn")
+    if old_turn in ("X", "O"):
+        consume_active_turn(state, now)
+    cancel_turn_task(state)
+
+    state["turn"] = turn_symbol
+    state["turn_secs"] = float(turn_secs)
+    state["turn_started_at"] = now
+
+    if state.get("time_limit", 0) > 0:
+        remaining = max(0.0, float(state.setdefault("match_remaining", {}).get(turn_symbol, 0.0)))
+        if remaining <= 0:
+            state["turn_deadline"] = now
+        else:
+            state["turn_deadline"] = now + min(float(turn_secs), remaining)
+        deadline = state["turn_deadline"]
+        state["task"] = asyncio.create_task(start_timeout(room_id, turn_symbol, deadline))
+    else:
+        state["turn_deadline"] = None
+        state["task"] = None
+
+
+def make_settings(state, player):
+    own = player.get("symbol", "X")
+    return {
+        "board_size": state.get("board_size", "20x20"),
+        "rule": state.get("rule", "Tiêu chuẩn"),
+        "time_limit": state.get("time_limit", 0),
+        "auto_rotate": bool(state.get("auto_rotate", True)),
+        "times": current_match_times(state),
+        "symbol": own,
+        "opponent_symbol": opponent(own),
+    }
 
 
 async def remove_player(room_id, ws):
+    outbound = []
+    task = None
     async with rooms_lock:
         room = rooms.get(room_id)
         if not room:
@@ -38,478 +230,406 @@ async def remove_player(room_id, ws):
         if not player:
             return
         room.remove(player)
-        remaining = list(room)
-        if not remaining:
-            del rooms[room_id]
+        if not room:
+            rooms.pop(room_id, None)
             return
-        if remaining[0].get("task") and not remaining[0]["task"].done():
-            try:
-                remaining[0]["task"].cancel()
-            except Exception:
-                pass
-    for p in remaining:
-        await send(p["ws"], {"type": "disconnect", "msg_key": "online_opp_left", "msg": "Đối thủ đã thoát."})
-
-
-def get_match_times(room0):
-    """Trả về times đã trừ thời gian đã trôi của lượt hiện tại (nếu đang đếm)."""
-    times = dict(room0.get("match_times", {"X": 0, "O": 0}))
-    turn = room0.get("turn")
-    deadline = room0.get("turn_deadline")
-    turn_secs = room0.get("turn_secs", TURN_SECS)
-    if turn and deadline and room0.get("time_limit", 0) > 0:
-        elapsed = max(0.0, turn_secs - max(0.0, deadline - time.time()))
-        # trừ vào người đang đi
-        times[turn] = max(0, int(round(times.get(turn, 0) - elapsed)))
-    return times
-
-
-async def start_timeout(room_id, expected_turn, turn_secs):
-    try:
-        await asyncio.sleep(turn_secs)
-        async with rooms_lock:
-            room = rooms.get(room_id)
-            if not room or len(room) < 2:
-                return
-            if room[0].get("turn") != expected_turn:
-                return
-            # Trừ hết turn vào match time
-            mt = room[0].setdefault("match_times", {"X": 0, "O": 0})
-            mt[expected_turn] = max(0, int(mt.get(expected_turn, 0) - turn_secs))
-            room[0]["turn"] = None
-            room[0]["turn_deadline"] = None
-            times = dict(mt)
-            for p in room:
-                await send(p["ws"], {
-                    "type": "timeout",
-                    "loser": expected_turn,
-                    "times": times,
-                    "server_ts": time.time()
-                })
-    except asyncio.CancelledError:
-        pass
-
-
-def schedule_turn(room, room_id, turn_symbol, turn_secs=TURN_SECS):
-    """Kết thúc lượt cũ (trừ thời gian đã dùng) rồi bắt đầu lượt mới."""
-    r0 = room[0]
-    old_turn = r0.get("turn")
-    old_deadline = r0.get("turn_deadline")
-    old_secs = r0.get("turn_secs", TURN_SECS)
-
-    # Hủy task cũ
-    if r0.get("task") and not r0["task"].done():
-        r0["task"].cancel()
-
-    # Trừ thời gian đã dùng của lượt cũ vào match_times
-    if old_turn and old_deadline and r0.get("time_limit", 0) > 0:
-        elapsed = max(0.0, old_secs - max(0.0, old_deadline - time.time()))
-        mt = r0.setdefault("match_times", {"X": 0, "O": 0})
-        mt[old_turn] = max(0, int(round(mt.get(old_turn, 0) - elapsed)))
-
-    r0["turn"] = turn_symbol
-    r0["turn_secs"] = turn_secs
-
-    if r0.get("time_limit", 0) > 0:
-        r0["turn_deadline"] = time.time() + turn_secs
-        r0["task"] = asyncio.create_task(
-            start_timeout(room_id, turn_symbol, turn_secs)
-        )
-    else:
-        r0["turn_deadline"] = None
-        r0["task"] = None
+        state = room_state(room)
+        task = state.get("task")
+        cancel_turn_task(state)
+        for p in room:
+            outbound.append((p["ws"], {
+                "type": "disconnect",
+                "msg_key": "online_opp_left",
+                "msg": "Đối thủ đã thoát.",
+            }))
+    if task:
+        with suppress(asyncio.CancelledError):
+            await asyncio.sleep(0)
+    await send_many(outbound)
 
 
 async def handler(ws):
     room_id = None
     player = None
-
     try:
         raw = await asyncio.wait_for(ws.recv(), timeout=15)
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
         data = json.loads(raw)
 
-        # Kết nối mồi nhẹ để đánh thức Render trước khi người chơi vào phòng.
-        # Warm-up không tạo phòng, không chạm vào game state và đóng ngay sau khi xác nhận.
         if data.get("action") == "warmup":
-            await send(ws, {"type": "warmup_ok"})
+            await safe_send(ws, {"type": "warmup_ok"})
             return
-
         if data.get("action") != "join":
-            await send(ws, {"type": "error", "msg_key": "online_invalid_request", "msg": "Yêu cầu không hợp lệ"})
+            await safe_send(ws, {"type": "error", "msg_key": "online_invalid_request", "msg": "Yêu cầu không hợp lệ"})
             return
 
         room_id = clean(data.get("room"), 32)
         name = clean(data.get("name"), 20, "Người chơi")
-
         try:
             time_limit = max(0, int(data.get("time_limit", 0)))
-        except Exception:
+        except (TypeError, ValueError):
             time_limit = 0
-
         board_size = data.get("board_size", "20x20")
-        if board_size not in ("15x15", "19x19", "20x20"):
+        if board_size not in VALID_BOARDS:
             board_size = "20x20"
         rule = clean(data.get("rule"), 32, "Tiêu chuẩn")
-        
-        # --- Lấy quân cờ người chơi chọn từ Client ---
-        req_symbol = data.get("symbol")
-        if req_symbol not in ("X", "O"):
-            req_symbol = "X"
-
+        req_symbol = data.get("symbol") if data.get("symbol") in ("X", "O") else "X"
         if not room_id:
-            await send(ws, {"type": "error", "msg_key": "online_need_room", "msg": "Thiếu mã phòng"})
+            await safe_send(ws, {"type": "error", "msg_key": "online_need_room", "msg": "Thiếu mã phòng"})
             return
 
-        # --- Gán symbol thay vì None ---
-        player = {"ws": ws, "name": name, "symbol": req_symbol, "task": None, "rematch_ready": False}
+        player = {
+            "ws": ws,
+            "name": name,
+            "symbol": req_symbol,
+            "rematch_ready": False,
+        }
+        outbound = []
+        close_old = None
 
         async with rooms_lock:
             room = rooms.setdefault(room_id, [])
-            
-            # 1. Dọn dẹp kết nối đã đóng rành rành
-            for p in list(room):
-                if getattr(p["ws"], "closed", False):
-                    room.remove(p)
+            # Remove stale sockets without doing network I/O under the lock.
+            room[:] = [p for p in room if not getattr(p["ws"], "closed", False)]
 
             if len(room) >= 2:
-                # 2. Xử lý triệt để: Ghi đè nếu trùng tên
-                old_duplicate = next((p for p in room if p["name"] == name), None)
-                if old_duplicate:
-                    # Đóng lập tức kết nối cũ đang kẹt và xóa khỏi phòng
-                    try:
-                        await old_duplicate["ws"].close()
-                    except Exception:
-                        pass
-                    room.remove(old_duplicate)
+                duplicate = next((p for p in room if p["name"] == name), None)
+                if duplicate:
+                    close_old = duplicate["ws"]
+                    room.remove(duplicate)
+                    state = room_state(room) if room else None
+                    if state:
+                        cancel_turn_task(state)
                 else:
-                    await send(ws, {"type": "error", "msg_key": "online_room_full", "msg": "Phòng đã đầy"})
-                    return
+                    outbound.append((ws, {"type": "error", "msg_key": "online_room_full", "msg": "Phòng đã đầy"}))
 
-            room.append(player)
-
-            if len(room) == 1:
-                player["board_size"] = board_size
-                player["rule"] = rule
-                player["time_limit"] = time_limit
-                player["auto_rotate"] = True
-                await send(ws, {"type": "waiting", "msg_key": "online_waiting", "msg": "Đã vào phòng. Đang chờ đối thủ..."})
+            if outbound:
+                pass
             else:
-                host = room[0]
-                final_board = host.get("board_size") or board_size
-                final_rule = host.get("rule") or rule
-                final_time = host.get("time_limit", time_limit)
-                if final_board not in ("15x15", "19x19", "20x20"):
-                    final_board = "20x20"
-
-                # --- Xử lý phân định quân cờ nếu đụng độ ---
-                host_sym = room[0].get("symbol", "X")
-                p2_sym = player.get("symbol", "O")
-                
-                # Nếu người vào sau chọn trùng quân với chủ phòng, ép nhận quân ngược lại
-                if p2_sym == host_sym:
-                    room[1]["symbol"] = "O" if host_sym == "X" else "X"
+                room.append(player)
+                if len(room) == 1:
+                    player.update({
+                        "board_size": board_size,
+                        "rule": rule,
+                        "time_limit": time_limit,
+                        "auto_rotate": True,
+                    })
+                    outbound.append((ws, {"type": "waiting", "msg_key": "online_waiting", "msg": "Đã vào phòng. Đang chờ đối thủ..."}))
                 else:
-                    room[1]["symbol"] = p2_sym
-
-                room[0]["time_limit"] = final_time
-                room[0]["board_size"] = final_board
-                room[0]["rule"] = final_rule
-                room[0]["match_times"] = {"X": final_time, "O": final_time}
-                room[0]["turn"] = "X"
-                room[0]["turn_deadline"] = None
-                room[0]["task"] = None
-                room[0]["auto_rotate"] = bool(room[0].get("auto_rotate", True))
-                for p in room:
-                    p["rematch_ready"] = False
-
-                for i, p in enumerate(room):
-                    opp = room[1 - i]
-                    await send(p["ws"], {
-                        "type": "start",
-                        "symbol": p["symbol"],
-                        "opponent_name": opp["name"],
-                        "board_size": final_board,
-                        "rule": final_rule,
+                    host = room[0]
+                    final_board = host.get("board_size") or board_size
+                    final_rule = host.get("rule") or rule
+                    final_time = max(0, int(host.get("time_limit", time_limit)))
+                    host_sym = host.get("symbol", "X")
+                    player["symbol"] = req_symbol if req_symbol != host_sym else opponent(host_sym)
+                    state = host
+                    state.update({
                         "time_limit": final_time,
-                        "auto_rotate": room[0].get("auto_rotate", True),
+                        "board_size": final_board if final_board in VALID_BOARDS else "20x20",
+                        "rule": final_rule,
+                        "match_remaining": {"X": float(final_time), "O": float(final_time)},
+                        "turn": None,
+                        "turn_deadline": None,
                         "turn_secs": TURN_SECS,
-                        "times": {"X": final_time, "O": final_time}
+                        "task": None,
+                        "auto_rotate": bool(state.get("auto_rotate", True)),
+                        "board": make_board(board_dimension(final_board)),
+                        "game_over": False,
+                        "winner": None,
                     })
-                    await send(p["ws"], {
-                        "type": "turn_start",
-                        "symbol": "X",
-                        "turn_secs": TURN_SECS,
-                        "deadline": None,
-                        "times": {"X": final_time, "O": final_time},
-                        "server_ts": time.time()
-                    })
+                    for p in room:
+                        p["rematch_ready"] = False
+
+                    for p in room:
+                        opp = room[1] if p is room[0] else room[0]
+                        outbound.append((p["ws"], {
+                            "type": "start",
+                            "symbol": p["symbol"],
+                            "opponent_name": opp["name"],
+                            "board_size": state["board_size"],
+                            "rule": state["rule"],
+                            "time_limit": final_time,
+                            "auto_rotate": state["auto_rotate"],
+                            "turn_secs": TURN_SECS,
+                            "times": {"X": final_time, "O": final_time},
+                        }))
+
+                    # First turn is authoritative and timed on the server too.
+                    schedule_turn_locked(room, room_id, "X", TURN_SECS)
+                    now = time.time()
+                    times = current_match_times(state, now)
+                    for p in room:
+                        outbound.append((p["ws"], {
+                            "type": "turn_start",
+                            "symbol": "X",
+                            "turn_secs": TURN_SECS,
+                            "deadline": state.get("turn_deadline"),
+                            "times": times,
+                            "server_ts": now,
+                        }))
+
+        if close_old:
+            with suppress(Exception):
+                await close_old.close()
+        await send_many(outbound)
+        if outbound and any(item[1].get("msg_key") == "online_room_full" for item in outbound):
+            return
 
         async for msg in ws:
+            if isinstance(msg, bytes):
+                if len(msg) > MAX_MESSAGE_BYTES:
+                    continue
+                msg = msg.decode("utf-8", "replace")
+            elif len(msg.encode("utf-8", "ignore")) > MAX_MESSAGE_BYTES:
+                continue
             try:
                 payload = json.loads(msg)
-            except Exception:
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict):
                 continue
 
+            outbound = []
+            close_sender = False
             async with rooms_lock:
                 room = rooms.get(room_id)
                 if not room:
                     break
-
-                if len(room) < 2:
-                    t = payload.get("type")
-                    if t == "symbol_update":
-                        p0 = room[0]
-                        new_sym = payload.get("symbol")
-                        if new_sym in ("X", "O"):
-                            p0["symbol"] = new_sym
-                        if "auto_rotate" in payload:
-                            p0["auto_rotate"] = bool(payload["auto_rotate"])
-                        own = p0.get("symbol", "X")
-                        await send(p0["ws"], {
-                            "type": "symbol_update",
-                            "symbol": own,
-                            "opponent_symbol": "O" if own == "X" else "X",
-                            "auto_rotate": bool(p0.get("auto_rotate", True))
-                        })
-                        continue
-                    if t in ("update_settings", "update_time_limit"):
-                        p0 = room[0]
-                        if "board_size" in payload:
-                            bs = payload["board_size"]
-                            if bs in ("15x15", "19x19", "20x20"):
-                                p0["board_size"] = bs
-                        if "rule" in payload:
-                            p0["rule"] = clean(payload["rule"], 32, "Tiêu chuẩn")
-                        if "time_limit" in payload:
-                            try:
-                                p0["time_limit"] = max(0, int(payload["time_limit"]))
-                            except Exception:
-                                pass
-                        if "auto_rotate" in payload:
-                            p0["auto_rotate"] = bool(payload["auto_rotate"])
-                        # Cập nhật quân cờ khi ở sảnh chờ 1 mình
-                        if "symbol" in payload and payload["symbol"] in ("X", "O"):
-                            p0["symbol"] = payload["symbol"]
-                        # Xác nhận lại trạng thái cho chính người đang chờ để client
-                        # luôn có cùng nguồn dữ liệu với server ngay cả trước khi đối thủ vào.
-                        own = p0.get("symbol", "X")
-                        await send(p0["ws"], {
-                            "type": "symbol_update",
-                            "symbol": own,
-                            "opponent_symbol": "O" if own == "X" else "X",
-                            "auto_rotate": bool(p0.get("auto_rotate", True))
-                        })
-                        await send(p0["ws"], {
-                            "type": "update_settings",
-                            "board_size": p0.get("board_size", "20x20"),
-                            "rule": p0.get("rule", "Tiêu chuẩn"),
-                            "time_limit": p0.get("time_limit", 0),
-                            "auto_rotate": bool(p0.get("auto_rotate", True)),
-                            "symbol": own,
-                            "opponent_symbol": "O" if own == "X" else "X",
-                            "times": dict(p0.get("match_times", {"X": 0, "O": 0}))
-                        })
-                    continue
-
                 sender = next((p for p in room if p["ws"] is ws), None)
                 if not sender:
                     break
-
+                state = room_state(room)
                 t = payload.get("type")
-                others = [p for p in room if p["ws"] is not ws]
 
-                if t == "move":
-                    r, c = payload.get("r"), payload.get("c")
-                    if not (isinstance(r, int) and isinstance(c, int) and 0 <= r < 20 and 0 <= c < 20):
-                        continue
-                    if room[0].get("turn") != sender["symbol"]:
-                        continue
-
-                    next_turn = "O" if sender["symbol"] == "X" else "X"
-                    schedule_turn(room, room_id, next_turn, TURN_SECS)
-
-                    deadline = room[0].get("turn_deadline")
-                    times = get_match_times(room[0])
-                    # get_match_times đã trừ elapsed của lượt MỚI — cần times SAU khi trừ lượt cũ
-                    # schedule_turn đã trừ lượt cũ vào match_times; get_match_times sẽ trừ thêm elapsed lượt mới (~0)
-                    times = dict(room[0].get("match_times", {"X": 0, "O": 0}))
-                    server_ts = time.time()
-
-                    for p in others:
-                        await send(p["ws"], payload)
-
-                    for p in room:
-                        await send(p["ws"], {
-                            "type": "turn_start",
-                            "symbol": next_turn,
-                            "turn_secs": TURN_SECS,
-                            "deadline": deadline,
-                            "times": times,
-                            "server_ts": server_ts
-                        })
-
-                elif t == "rematch":
-                    # Chỉ ghi nhận người chơi đã sẵn sàng. Không bắt đầu ngay.
-                    # Khi cả 2 cùng sẵn sàng, server mới chốt quân và phát lệnh rematch.
-                    # Rematch chỉ là tín hiệu READY.
-                    # Tuyệt đối không đọc/chốt symbol từ gói rematch: phe đã được
-                    # đồng bộ trước đó qua update_settings và server sẽ tự quyết định
-                    # việc giữ nguyên hay đảo phe dựa trên auto_rotate.
-                    sender["rematch_ready"] = True
-
-                    if not all(p.get("rematch_ready", False) for p in room):
-                        continue
-
-                    # Cả hai đã sẵn sàng -> server chốt quân cho ván mới.
-                    # AUTO ON: mỗi người đổi X <-> O.
-                    # AUTO OFF: giữ nguyên quân hiện tại.
-                    if room[0].get("auto_rotate", True):
-                        for p in room:
-                            p["symbol"] = "O" if p["symbol"] == "X" else "X"
-
-                    if room[0].get("task") and not room[0]["task"].done():
-                        room[0]["task"].cancel()
-
-                    limit = room[0].get("time_limit", 0)
-                    room[0]["match_times"] = {"X": limit, "O": limit}
-                    room[0]["turn"] = "X"
-                    room[0]["turn_deadline"] = None
-                    room[0]["task"] = None
-
-                    for p in room:
-                        p["rematch_ready"] = False
-
-                    # Gửi cho từng client chính quân mà client đó sẽ dùng.
-                    for p in room:
-                        await send(p["ws"], {
-                            "type": "rematch",
-                            "symbol": p["symbol"],
-                            "auto_rotate": room[0].get("auto_rotate", True)
-                        })
-
-                    for p in room:
-                        await send(p["ws"], {
-                            "type": "turn_start",
-                            "symbol": "X",
-                            "turn_secs": TURN_SECS,
-                            "deadline": None,
-                            "times": {"X": limit, "O": limit},
-                            "server_ts": time.time()
-                        })
-
-                elif t == "timeout":
-                    if room[0].get("task") and not room[0]["task"].done():
-                        room[0]["task"].cancel()
-                    loser = payload.get("loser")
-                    # Trừ nốt turn vào match time
-                    if loser and room[0].get("turn_deadline"):
-                        elapsed = max(0.0, room[0].get("turn_secs", TURN_SECS) - max(0.0, room[0]["turn_deadline"] - time.time()))
-                        mt = room[0].setdefault("match_times", {"X": 0, "O": 0})
-                        mt[loser] = max(0, int(round(mt.get(loser, 0) - elapsed)))
-                    room[0]["turn"] = None
-                    room[0]["turn_deadline"] = None
-                    times = dict(room[0].get("match_times", {"X": 0, "O": 0}))
-                    for p in room:
-                        await send(p["ws"], {
-                            "type": "timeout",
-                            "loser": loser,
-                            "times": times,
-                            "server_ts": time.time()
-                        })
-
-                elif t == "symbol_update":
-                    # Phe là trạng thái riêng cần phản ánh NGAY, kể cả khi ván đã kết thúc.
-                    new_sym = payload.get("symbol")
-                    if new_sym not in ("X", "O"):
-                        continue
-                    # Người gửi chọn quân mới; server chốt NGAY cặp quân cho cả phòng.
-                    # Client gửi X -> đối thủ nhận O ngay; client gửi O -> đối thủ nhận X ngay.
-                    # Không chờ ván mới và không thể xảy ra trạng thái cả hai cùng X/O.
-                    sender["symbol"] = new_sym
-                    for p in room:
-                        if p is not sender:
-                            p["symbol"] = "O" if new_sym == "X" else "X"
-                    if "auto_rotate" in payload:
-                        room[0]["auto_rotate"] = bool(payload["auto_rotate"])
-                    for p in room:
-                        own_symbol = p["symbol"]
-                        opponent_symbol = "O" if own_symbol == "X" else "X"
-                        await send(p["ws"], {
-                            "type": "symbol_update",
-                            # symbol = quân của CHÍNH client nhận message
-                            "symbol": own_symbol,
-                            "opponent_symbol": opponent_symbol,
-                            "auto_rotate": room[0].get("auto_rotate", False)
-                        })
-
-                elif t == "update_settings":
-                    if "board_size" in payload:
-                        bs = payload["board_size"]
-                        if bs in ("15x15", "19x19", "20x20"):
-                            room[0]["board_size"] = bs
-                    if "rule" in payload:
-                        room[0]["rule"] = clean(payload["rule"], 32, "Tiêu chuẩn")
-                    if "time_limit" in payload:
-                        try:
-                            new_limit = max(0, int(payload["time_limit"]))
-                            room[0]["time_limit"] = new_limit
-                        except Exception:
-                            pass
-                            
-                    # --- Bổ sung đồng bộ trạng thái Tự động (auto_rotate) ---
-                    if "auto_rotate" in payload:
-                        room[0]["auto_rotate"] = bool(payload["auto_rotate"])
-
-                    if "symbol" in payload:
-                        new_sym = payload["symbol"]
+                if len(room) < 2:
+                    if t == "symbol_update":
+                        new_sym = payload.get("symbol")
                         if new_sym in ("X", "O"):
-                            # Server chốt cặp quân cho cả phòng.
                             sender["symbol"] = new_sym
-                            for p in others:
-                                p["symbol"] = "O" if new_sym == "X" else "X"
-
-                    # Gửi cho TẤT CẢ client trạng thái cuối cùng của chính họ.
-                    # Như vậy mỗi máy luôn hiển thị đúng X/O/🔄 mà server đã chốt.
-                    for p in room:
-                        resp = {
-                            "type": "update_settings",
-                            "board_size": room[0].get("board_size", "20x20"),
-                            "rule": room[0].get("rule", "Tiêu chuẩn"),
-                            "time_limit": room[0].get("time_limit", 0),
-                            "auto_rotate": room[0].get("auto_rotate", True),
-                            "times": dict(room[0].get("match_times", {"X": 0, "O": 0})),
-                            "symbol": p["symbol"],
-                            "opponent_symbol": ("O" if p["symbol"] == "X" else "X")
-                        }
-                        await send(p["ws"], resp)
-
-                elif t == "update_time_limit":
-                    # Tương thích với client cũ: dù dùng message riêng, vẫn cập nhật
-                    # state chung và broadcast lại cho toàn bộ phòng ngay lập tức.
-                    try:
-                        new_limit = max(0, int(payload.get("time_limit", 0)))
-                        room[0]["time_limit"] = new_limit
-                        if room[0].get("turn_deadline") is None:
-                            room[0]["match_times"] = {"X": new_limit, "O": new_limit}
-                    except Exception:
-                        pass
-                    for p in room:
-                        await send(p["ws"], {
-                            "type": "update_settings",
-                            "board_size": room[0].get("board_size", "20x20"),
-                            "rule": room[0].get("rule", "Tiêu chuẩn"),
-                            "time_limit": room[0].get("time_limit", 0),
-                            "auto_rotate": room[0].get("auto_rotate", True),
-                            "symbol": p.get("symbol", "X"),
-                            "opponent_symbol": "O" if p.get("symbol", "X") == "X" else "X",
-                            "times": dict(room[0].get("match_times", {"X": 0, "O": 0}))
-                        })
-
+                        if "auto_rotate" in payload:
+                            sender["auto_rotate"] = bool(payload["auto_rotate"])
+                        own = sender.get("symbol", "X")
+                        outbound.append((ws, {
+                            "type": "symbol_update",
+                            "symbol": own,
+                            "opponent_symbol": opponent(own),
+                            "auto_rotate": bool(sender.get("auto_rotate", True)),
+                        }))
+                    elif t in ("update_settings", "update_time_limit"):
+                        if "board_size" in payload and payload["board_size"] in VALID_BOARDS:
+                            sender["board_size"] = payload["board_size"]
+                        if "rule" in payload:
+                            sender["rule"] = clean(payload["rule"], 32, "Tiêu chuẩn")
+                        if "time_limit" in payload:
+                            try:
+                                sender["time_limit"] = max(0, int(payload["time_limit"]))
+                            except (TypeError, ValueError):
+                                pass
+                        if "auto_rotate" in payload:
+                            sender["auto_rotate"] = bool(payload["auto_rotate"])
+                        if payload.get("symbol") in ("X", "O"):
+                            sender["symbol"] = payload["symbol"]
+                        own = sender.get("symbol", "X")
+                        outbound.extend([
+                            (ws, {"type": "symbol_update", "symbol": own,
+                                  "opponent_symbol": opponent(own),
+                                  "auto_rotate": bool(sender.get("auto_rotate", True))}),
+                            (ws, {"type": "update_settings", **make_settings(sender, sender)}),
+                        ])
+                    elif t == "chat":
+                        text = clean(payload.get("text"), 500)
+                        if text:
+                            outbound.append((ws, {"type": "chat", "name": sender["name"], "text": text}))
+                    # Other game messages are ignored while waiting.
                 else:
-                    for p in others:
-                        await send(p["ws"], payload)
+                    others = [p for p in room if p["ws"] is not ws]
 
+                    if t == "move":
+                        r, c = payload.get("r"), payload.get("c")
+                        n = board_dimension(state.get("board_size", "20x20"))
+                        reason = None
+                        if state.get("game_over"):
+                            reason = "game_over"
+                        elif state.get("turn") != sender.get("symbol"):
+                            reason = "not_your_turn"
+                        elif not (valid_int(r) and valid_int(c) and 0 <= r < n and 0 <= c < n):
+                            reason = "invalid_cell"
+                        elif state["board"][r][c] != "":
+                            reason = "occupied"
+
+                        if reason:
+                            outbound.append((ws, {"type": "move_rejected", "reason": reason}))
+                        else:
+                            now = time.time()
+                            # A move arriving after the server deadline is a timeout, not a valid move.
+                            deadline = state.get("turn_deadline")
+                            if deadline and now >= deadline:
+                                consume_active_turn(state, now)
+                                cancel_turn_task(state)
+                                loser = state["turn"]
+                                state["turn"] = None
+                                state["turn_deadline"] = None
+                                state["turn_started_at"] = None
+                                state["game_over"] = True
+                                state["winner"] = opponent(loser)
+                                times = current_match_times(state, now)
+                                timeout_payload = {"type": "timeout", "loser": loser, "times": times, "server_ts": now}
+                                outbound.extend((p["ws"], timeout_payload) for p in room)
+                            else:
+                                state["board"][r][c] = sender["symbol"]
+                                state["last_move"] = (r, c)
+                                consume_active_turn(state, now)
+                                cancel_turn_task(state)
+                                move_payload = {"type": "move", "r": r, "c": c}
+                                for p in others:
+                                    outbound.append((p["ws"], move_payload))
+
+                                win_line = check_win(state["board"], r, c, sender["symbol"], state.get("rule"))
+                                if win_line:
+                                    state["game_over"] = True
+                                    state["winner"] = sender["symbol"]
+                                    state["turn"] = None
+                                    state["turn_deadline"] = None
+                                    state["turn_started_at"] = None
+                                    result = {
+                                        "type": "game_result",
+                                        "result": "win",
+                                        "winner": sender["symbol"],
+                                        "line": win_line,
+                                    }
+                                    outbound.extend((p["ws"], result) for p in room)
+                                elif all(cell != "" for row in state["board"] for cell in row):
+                                    state["game_over"] = True
+                                    state["winner"] = None
+                                    state["turn"] = None
+                                    state["turn_deadline"] = None
+                                    state["turn_started_at"] = None
+                                    result = {"type": "game_result", "result": "draw", "winner": None, "line": []}
+                                    outbound.extend((p["ws"], result) for p in room)
+                                else:
+                                    next_turn = opponent(sender["symbol"])
+                                    schedule_turn_locked(room, room_id, next_turn, TURN_SECS)
+                                    times = current_match_times(state, now)
+                                    turn_payload = {
+                                        "type": "turn_start",
+                                        "symbol": next_turn,
+                                        "turn_secs": TURN_SECS,
+                                        "deadline": state.get("turn_deadline"),
+                                        "times": times,
+                                        "server_ts": now,
+                                    }
+                                    outbound.extend((p["ws"], turn_payload) for p in room)
+
+                    elif t == "timeout":
+                        # Never trust the client's loser value or local clock.
+                        now = time.time()
+                        if state.get("game_over") or state.get("turn") != sender.get("symbol"):
+                            continue
+                        deadline = state.get("turn_deadline")
+                        if not deadline or now < deadline:
+                            continue
+                        consume_active_turn(state, now)
+                        cancel_turn_task(state)
+                        loser = state["turn"]
+                        state["turn"] = None
+                        state["turn_deadline"] = None
+                        state["game_over"] = True
+                        state["winner"] = opponent(loser)
+                        times = current_match_times(state, now)
+                        outbound.extend((p["ws"], {
+                            "type": "timeout", "loser": loser, "times": times, "server_ts": now
+                        }) for p in room)
+
+                    elif t == "rematch":
+                        sender["rematch_ready"] = True
+                        if all(p.get("rematch_ready", False) for p in room):
+                            if state.get("auto_rotate", True):
+                                for p in room:
+                                    p["symbol"] = opponent(p["symbol"])
+                            cancel_turn_task(state)
+                            limit = int(state.get("time_limit", 0))
+                            state["match_remaining"] = {"X": float(limit), "O": float(limit)}
+                            state["board"] = make_board(board_dimension(state.get("board_size", "20x20")))
+                            state["game_over"] = False
+                            state["winner"] = None
+                            state["last_move"] = None
+                            state["turn"] = None
+                            state["turn_deadline"] = None
+                            state["turn_started_at"] = None
+                            for p in room:
+                                p["rematch_ready"] = False
+                                outbound.append((p["ws"], {
+                                    "type": "rematch",
+                                    "symbol": p["symbol"],
+                                    "auto_rotate": bool(state.get("auto_rotate", True)),
+                                }))
+                            schedule_turn_locked(room, room_id, "X", TURN_SECS)
+                            now = time.time()
+                            times = current_match_times(state, now)
+                            outbound.extend((p["ws"], {
+                                "type": "turn_start", "symbol": "X", "turn_secs": TURN_SECS,
+                                "deadline": state.get("turn_deadline"), "times": times, "server_ts": now
+                            }) for p in room)
+
+                    elif t == "symbol_update":
+                        new_sym = payload.get("symbol")
+                        if new_sym not in ("X", "O"):
+                            continue
+                        sender["symbol"] = new_sym
+                        for p in others:
+                            p["symbol"] = opponent(new_sym)
+                        if "auto_rotate" in payload:
+                            state["auto_rotate"] = bool(payload["auto_rotate"])
+                        for p in room:
+                            outbound.append((p["ws"], {
+                                "type": "symbol_update", "symbol": p["symbol"],
+                                "opponent_symbol": opponent(p["symbol"]),
+                                "auto_rotate": bool(state.get("auto_rotate", False)),
+                            }))
+
+                    elif t in ("update_settings", "update_time_limit"):
+                        # Settings are only applied safely between moves; board/rule changes
+                        # during a running game would invalidate authoritative state.
+                        if state.get("game_over") or not state.get("board") or not any(any(row) for row in state["board"]):
+                            if payload.get("board_size") in VALID_BOARDS:
+                                state["board_size"] = payload["board_size"]
+                                state["board"] = make_board(board_dimension(state["board_size"]))
+                            if "rule" in payload:
+                                state["rule"] = clean(payload["rule"], 32, "Tiêu chuẩn")
+                            if "time_limit" in payload:
+                                try:
+                                    new_limit = max(0, int(payload["time_limit"]))
+                                    state["time_limit"] = new_limit
+                                    if state.get("game_over") or state.get("turn") is None:
+                                        state["match_remaining"] = {"X": float(new_limit), "O": float(new_limit)}
+                                except (TypeError, ValueError):
+                                    pass
+                        if "auto_rotate" in payload:
+                            state["auto_rotate"] = bool(payload["auto_rotate"])
+                        if payload.get("symbol") in ("X", "O"):
+                            sender["symbol"] = payload["symbol"]
+                            for p in others:
+                                p["symbol"] = opponent(sender["symbol"])
+                        for p in room:
+                            outbound.append((p["ws"], {"type": "update_settings", **make_settings(state, p)}))
+
+                    elif t == "chat":
+                        text = clean(payload.get("text"), 500)
+                        if text:
+                            outbound.extend((p["ws"], {"type": "chat", "name": sender["name"], "text": text}) for p in room)
+
+                    else:
+                        # Keep compatibility for harmless future/non-game messages.
+                        for p in others:
+                            outbound.append((p["ws"], payload))
+
+            await send_many(outbound)
+
+    except (asyncio.CancelledError, websockets.exceptions.ConnectionClosed):
+        pass
     except Exception:
+        # A single malformed client must never bring down the server.
         pass
     finally:
         if room_id and player:
@@ -519,9 +639,15 @@ async def handler(ws):
 async def main():
     port = int(os.environ.get("PORT", 3000))
     print(f"XOUltra-AI Server port {port} | TURN_SECS={TURN_SECS}")
-    # Heartbeat ổn định: interval luôn lớn hơn timeout để tương thích client/server.
-    # Ping mỗi 30s và chờ pong tối đa 20s, đủ chịu mạng chập chờn ngắn.
-    async with websockets.serve(handler, "0.0.0.0", port, ping_interval=30, ping_timeout=20):
+    async with websockets.serve(
+        handler,
+        "0.0.0.0",
+        port,
+        ping_interval=30,
+        ping_timeout=20,
+        max_size=MAX_MESSAGE_BYTES,
+        max_queue=32,
+    ):
         await asyncio.Future()
 
 
