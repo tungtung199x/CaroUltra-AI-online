@@ -519,9 +519,9 @@ async def handler(ws):
 async def main():
     port = int(os.environ.get("PORT", 3000))
     print(f"XOUltra-AI Server port {port} | TURN_SECS={TURN_SECS}")
-    # Heartbeat rộng để chịu được mạng chập chờn ngắn mà không đá người chơi khỏi phòng.
-    # Client cũng chủ động ping mỗi 15s; server chờ pong tối đa 60s.
-    async with websockets.serve(handler, "0.0.0.0", port, ping_interval=15, ping_timeout=60):
+    # Heartbeat ổn định: interval luôn lớn hơn timeout để tương thích client/server.
+    # Ping mỗi 30s và chờ pong tối đa 20s, đủ chịu mạng chập chờn ngắn.
+    async with websockets.serve(handler, "0.0.0.0", port, ping_interval=30, ping_timeout=20):
         await asyncio.Future()
 
 
