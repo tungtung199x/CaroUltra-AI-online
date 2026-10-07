@@ -408,7 +408,8 @@ async def handler(ws):
                             "time_limit": room[0].get("time_limit", 0),
                             "auto_rotate": room[0].get("auto_rotate", True),
                             "times": dict(room[0].get("match_times", {"X": 0, "O": 0})),
-                            "symbol": p["symbol"]
+                            "symbol": p["symbol"],
+                            "opponent_symbol": ("O" if p["symbol"] == "X" else "X")
                         }
                         await send(p["ws"], resp)
 
