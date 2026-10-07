@@ -10,6 +10,7 @@ rooms = {}
 rooms_lock = asyncio.Lock()
 
 TURN_SECS = 35
+MAX_TIME_LIMIT_SECONDS = 7 * 24 * 60 * 60
 VALID_BOARDS = {"15x15": 15, "20x20": 20}
 MAX_MESSAGE_BYTES = 64 * 1024
 
@@ -27,6 +28,14 @@ def board_dimension(board_size):
 
 def valid_int(value):
     return isinstance(value, int) and not isinstance(value, bool)
+
+def parse_time_limit(value, default=0):
+    """Parse a client-supplied match limit without allowing huge integers to poison state."""
+    try:
+        value = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return min(MAX_TIME_LIMIT_SECONDS, max(0, value))
 
 
 def opponent(symbol):
@@ -77,8 +86,10 @@ def consume_active_turn(state, now=None):
 
 
 def cancel_turn_task(state):
+    """Cancel the active turn watchdog, but never cancel the task calling us."""
     task = state.get("task")
-    if task and not task.done():
+    current = asyncio.current_task()
+    if task and task is not current and not task.done():
         task.cancel()
     state["task"] = None
 
@@ -266,10 +277,7 @@ async def handler(ws):
 
         room_id = clean(data.get("room"), 32)
         name = clean(data.get("name"), 20, "Người chơi")
-        try:
-            time_limit = max(0, int(data.get("time_limit", 0)))
-        except (TypeError, ValueError):
-            time_limit = 0
+        time_limit = parse_time_limit(data.get("time_limit", 0))
         board_size = data.get("board_size", "20x20")
         if board_size not in VALID_BOARDS:
             board_size = "20x20"
@@ -320,7 +328,7 @@ async def handler(ws):
                     host = room[0]
                     final_board = host.get("board_size") or board_size
                     final_rule = host.get("rule") or rule
-                    final_time = max(0, int(host.get("time_limit", time_limit)))
+                    final_time = parse_time_limit(host.get("time_limit", time_limit), time_limit)
                     host_sym = host.get("symbol", "X")
                     player["symbol"] = req_symbol if req_symbol != host_sym else opponent(host_sym)
                     state = host
@@ -605,25 +613,34 @@ async def handler(ws):
                             }))
 
                     elif t in ("update_settings", "update_time_limit"):
-                        # Settings are only applied safely between moves; board/rule changes
-                        # during a running game would invalidate authoritative state.
-                        if state.get("game_over") or not state.get("board") or not any(any(row) for row in state["board"]):
+                        # Settings are only applied safely before the first move.
+                        has_moves = bool(state.get("board")) and any(
+                            any(cell != "" for cell in row) for row in state["board"]
+                        )
+                        if state.get("game_over") or not has_moves:
                             if payload.get("board_size") in VALID_BOARDS:
                                 state["board_size"] = payload["board_size"]
                                 state["board"] = make_board(board_dimension(state["board_size"]))
                             if "rule" in payload:
                                 state["rule"] = clean(payload["rule"], 32, "Tiêu chuẩn")
                             if "time_limit" in payload:
-                                try:
-                                    new_limit = max(0, int(payload["time_limit"]))
-                                    state["time_limit"] = new_limit
-                                    if state.get("game_over") or state.get("turn") is None:
-                                        state["match_remaining"] = {"X": float(new_limit), "O": float(new_limit)}
-                                except (TypeError, ValueError):
-                                    pass
+                                new_limit = parse_time_limit(payload["time_limit"], state.get("time_limit", 0))
+                                state["time_limit"] = new_limit
+                                if not has_moves:
+                                    state["match_remaining"] = {
+                                        "X": float(new_limit), "O": float(new_limit)
+                                    }
+                                    # The first turn already has a watchdog. Rebuild it
+                                    # so a changed limit cannot leave the old deadline alive.
+                                    if state.get("turn") in ("X", "O") and not state.get("game_over"):
+                                        schedule_turn_locked(
+                                            room, room_id, state["turn"],
+                                            state.get("turn_secs", TURN_SECS)
+                                        )
                         if "auto_rotate" in payload:
                             state["auto_rotate"] = bool(payload["auto_rotate"])
-                        if payload.get("symbol") in ("X", "O"):
+                        # Symbol selection is locked once the first move exists.
+                        if not has_moves and payload.get("symbol") in ("X", "O"):
                             sender["symbol"] = payload["symbol"]
                             for p in others:
                                 p["symbol"] = opponent(sender["symbol"])
