@@ -155,14 +155,25 @@ async def handler(ws):
         async with rooms_lock:
             room = rooms.setdefault(room_id, [])
             
-            # ĐÃ THÊM: Tự động quét và dọn dẹp các kết nối cũ đã đóng trước khi đếm người
+            # 1. Dọn dẹp kết nối đã đóng rành rành
             for p in list(room):
                 if p["ws"].closed:
                     room.remove(p)
-                    
+
             if len(room) >= 2:
-                await send(ws, {"type": "error", "msg": "Phòng đã đầy"})
-                return
+                # 2. Xử lý triệt để: Ghi đè nếu trùng tên
+                old_duplicate = next((p for p in room if p["name"] == name), None)
+                if old_duplicate:
+                    # Đóng lập tức kết nối cũ đang kẹt và xóa khỏi phòng
+                    try:
+                        await old_duplicate["ws"].close()
+                    except Exception:
+                        pass
+                    room.remove(old_duplicate)
+                else:
+                    await send(ws, {"type": "error", "msg": "Phòng đã đầy"})
+                    return
+
             room.append(player)
 
             if len(room) == 1:
