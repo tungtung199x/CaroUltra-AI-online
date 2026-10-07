@@ -157,7 +157,7 @@ async def handler(ws):
             
             # 1. Dọn dẹp kết nối đã đóng rành rành
             for p in list(room):
-                if p["ws"].closed:
+                if getattr(p["ws"], "closed", False):
                     room.remove(p)
 
             if len(room) >= 2:
@@ -306,21 +306,18 @@ async def handler(ws):
                 elif t == "rematch":
                     # Chỉ ghi nhận người chơi đã sẵn sàng. Không bắt đầu ngay.
                     # Khi cả 2 cùng sẵn sàng, server mới chốt quân và phát lệnh rematch.
+                    # Rematch chỉ là tín hiệu READY.
+                    # Tuyệt đối không đọc/chốt symbol từ gói rematch: phe đã được
+                    # đồng bộ trước đó qua update_settings và server sẽ tự quyết định
+                    # việc giữ nguyên hay đảo phe dựa trên auto_rotate.
                     sender["rematch_ready"] = True
-
-                    req_sym = payload.get("symbol")
-                    if req_sym in ("X", "O"):
-                        sender["symbol"] = req_sym
-                        # Nếu người chơi chủ động chọn quân, đối thủ luôn nhận quân ngược lại.
-                        for p in others:
-                            p["symbol"] = "O" if req_sym == "X" else "X"
 
                     if not all(p.get("rematch_ready", False) for p in room):
                         continue
 
-                    # Cả hai đã sẵn sàng -> chốt quân cho ván mới.
-                    # auto_rotate=True: mỗi người đổi X <-> O.
-                    # auto_rotate=False: giữ nguyên quân hiện tại.
+                    # Cả hai đã sẵn sàng -> server chốt quân cho ván mới.
+                    # AUTO ON: mỗi người đổi X <-> O.
+                    # AUTO OFF: giữ nguyên quân hiện tại.
                     if room[0].get("auto_rotate", True):
                         for p in room:
                             p["symbol"] = "O" if p["symbol"] == "X" else "X"
