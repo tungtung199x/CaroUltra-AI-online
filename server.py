@@ -411,8 +411,9 @@ async def handler(ws):
                     new_sym = payload.get("symbol")
                     if new_sym not in ("X", "O"):
                         continue
-                    # Người gửi chọn quân mới; server luôn ép người còn lại là quân đối nghịch.
-                    # Như vậy không thể xảy ra trạng thái cả hai cùng X hoặc cùng O.
+                    # Người gửi chọn quân mới; server chốt NGAY cặp quân cho cả phòng.
+                    # Client gửi X -> đối thủ nhận O ngay; client gửi O -> đối thủ nhận X ngay.
+                    # Không chờ ván mới và không thể xảy ra trạng thái cả hai cùng X/O.
                     sender["symbol"] = new_sym
                     for p in room:
                         if p is not sender:
