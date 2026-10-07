@@ -545,6 +545,14 @@ async def handler(ws):
 
                     elif t == "rematch":
                         sender["rematch_ready"] = True
+                        # Báo ngay cho cả phòng biết một người đã READY.
+                        # Trước đây server chỉ gửi khi cả hai cùng READY, khiến
+                        # máy còn lại vẫn hiển thị kết quả ván cũ dù đối thủ đã
+                        # bấm VÁN MỚI.
+                        outbound.extend((p["ws"], {
+                            "type": "rematch_waiting",
+                            "ready_symbol": sender.get("symbol")
+                        }) for p in room)
                         if all(p.get("rematch_ready", False) for p in room):
                             if state.get("auto_rotate", True):
                                 for p in room:
