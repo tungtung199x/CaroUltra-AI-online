@@ -404,6 +404,8 @@ async def handler(ws):
 
                 if len(room) < 2:
                     if t == "symbol_update":
+                        # Trước khi trận bắt đầu, người chơi vẫn được đổi X/O/Tự động.
+                        # Phòng chờ chưa có bàn cờ nên chưa có nước đi để khóa lựa chọn.
                         new_sym = payload.get("symbol")
                         if new_sym in ("X", "O"):
                             sender["symbol"] = new_sym
@@ -573,14 +575,20 @@ async def handler(ws):
                             }) for p in room)
 
                     elif t == "symbol_update":
-                        new_sym = payload.get("symbol")
-                        if new_sym not in ("X", "O"):
-                            continue
-                        sender["symbol"] = new_sym
-                        for p in others:
-                            p["symbol"] = opponent(new_sym)
-                        if "auto_rotate" in payload:
-                            state["auto_rotate"] = bool(payload["auto_rotate"])
+                        # Sau nước đầu tiên, server khóa X/O/Tự động để client
+                        # không thể bypass trạng thái disabled bằng packet thủ công.
+                        has_moves = bool(state.get("board")) and any(
+                            any(cell != "" for cell in row) for row in state["board"]
+                        )
+                        if not has_moves:
+                            new_sym = payload.get("symbol")
+                            if new_sym not in ("X", "O"):
+                                continue
+                            sender["symbol"] = new_sym
+                            for p in others:
+                                p["symbol"] = opponent(new_sym)
+                            if "auto_rotate" in payload:
+                                state["auto_rotate"] = bool(payload["auto_rotate"])
                         for p in room:
                             outbound.append((p["ws"], {
                                 "type": "symbol_update", "symbol": p["symbol"],
