@@ -128,6 +128,12 @@ async def handler(ws):
         raw = await asyncio.wait_for(ws.recv(), timeout=15)
         data = json.loads(raw)
 
+        # Kết nối mồi nhẹ để đánh thức Render trước khi người chơi vào phòng.
+        # Warm-up không tạo phòng, không chạm vào game state và đóng ngay sau khi xác nhận.
+        if data.get("action") == "warmup":
+            await send(ws, {"type": "warmup_ok"})
+            return
+
         if data.get("action") != "join":
             await send(ws, {"type": "error", "msg_key": "online_invalid_request", "msg": "Yêu cầu không hợp lệ"})
             return
