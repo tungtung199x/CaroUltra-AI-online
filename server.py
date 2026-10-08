@@ -316,7 +316,7 @@ async def handler(ws):
         async with rooms_lock:
             room = rooms.setdefault(room_id, [])
             
-            # QUAN TRỌNG: Lọc bỏ ngay các socket cũ đã chết hoặc CÙNG TÊN người chơi vừa kết nối lại
+            # Lọc socket chết + cùng tên (reconnect)
             room[:] = [p for p in room if not getattr(p["ws"], "closed", False) and p["name"] != name]
 
             if len(room) >= 2:
@@ -324,35 +324,28 @@ async def handler(ws):
             else:
                 room.append(player)
                 if len(room) == 1:
+                    # Host giữ setting
                     player.update({
                         "board_size": board_size,
                         "rule": rule,
                         "time_limit": time_limit,
                         "auto_rotate": True,
                     })
-                    outbound.append((ws, {"type": "waiting", "msg_key": "online_waiting", "msg": "Đã vào phòng. Đang chờ đối thủ..."}))
+                    outbound.append((ws, {
+                        "type": "waiting",
+                        "msg_key": "online_waiting",
+                        "msg": "Đã vào phòng. Đang chờ đối thủ..."
+                    }))
                 else:
-                    # Thiết lập trận đấu khi đủ 2 người...
-
-            if outbound:
-                pass
-            else:
-                room.append(player)
-                if len(room) == 1:
-                    player.update({
-                        "board_size": board_size,
-                        "rule": rule,
-                        "time_limit": time_limit,
-                        "auto_rotate": True,
-                    })
-                    outbound.append((ws, {"type": "waiting", "msg_key": "online_waiting", "msg": "Đã vào phòng. Đang chờ đối thủ..."}))
-                else:
+                    # Đủ 2 người → chốt trận
                     host = room[0]
                     final_board = host.get("board_size") or board_size
                     final_rule = host.get("rule") or rule
                     final_time = parse_time_limit(host.get("time_limit", time_limit), time_limit)
                     host_sym = host.get("symbol", "X")
+                    # Client mới nhận quân đối diện nếu trùng
                     player["symbol"] = req_symbol if req_symbol != host_sym else opponent(host_sym)
+
                     state = host
                     state.update({
                         "time_limit": final_time,
@@ -385,7 +378,7 @@ async def handler(ws):
                             "times": {"X": final_time, "O": final_time},
                         }))
 
-                    # First turn is authoritative and timed on the server too.
+                    # X đi trước, server lock deadline
                     schedule_turn_locked(room, room_id, "X", TURN_SECS)
                     now = time.time()
                     times = current_match_times(state, now)
