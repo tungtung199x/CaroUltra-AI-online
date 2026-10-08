@@ -148,10 +148,27 @@ async def safe_send(ws, data):
 
 
 async def send_many(items):
-    """Network I/O happens outside rooms_lock and in parallel."""
+    """Send concurrently between sockets, but sequentially per socket.
+
+    A room event can contain several packets for the same WebSocket (for example
+    rematch_waiting -> rematch -> turn_start). Sending those packets as separate
+    concurrent coroutines can reorder/interleave them on some websocket versions.
+    """
     if not items:
         return
-    await asyncio.gather(*(safe_send(ws, data) for ws, data in items), return_exceptions=True)
+    grouped = {}
+    for ws, data in items:
+        grouped.setdefault(ws, []).append(data)
+
+    async def send_socket(ws, messages):
+        for data in messages:
+            if not await safe_send(ws, data):
+                break
+
+    await asyncio.gather(
+        *(send_socket(ws, messages) for ws, messages in grouped.items()),
+        return_exceptions=True,
+    )
 
 
 async def start_timeout(room_id, expected_turn, expected_deadline):
