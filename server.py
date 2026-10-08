@@ -315,21 +315,28 @@ async def handler(ws):
 
         async with rooms_lock:
             room = rooms.setdefault(room_id, [])
-            # Loại bỏ ngay các socket cũ đã đóng hoặc trùng tên để tránh kẹt phòng
+            
+            # QUAN TRỌNG: Lọc bỏ ngay các socket cũ đã chết hoặc CÙNG TÊN người chơi vừa kết nối lại
             room[:] = [p for p in room if not getattr(p["ws"], "closed", False) and p["name"] != name]
 
             if len(room) >= 2:
-                duplicate = next((p for p in room if p["name"] == name), None)
-                if duplicate:
-                    close_old = duplicate["ws"]
-                    room.remove(duplicate)
-                    state = room_state(room) if room else None
-                    if state:
-                        cancel_turn_task(state)
+                outbound.append((ws, {"type": "error", "msg_key": "online_room_full", "msg": "Phòng đã đầy"}))
+            else:
+                room.append(player)
+                if len(room) == 1:
+                    player.update({
+                        "board_size": board_size,
+                        "rule": rule,
+                        "time_limit": time_limit,
+                        "auto_rotate": True,
+                    })
+                    outbound.append((ws, {"type": "waiting", "msg_key": "online_waiting", "msg": "Đã vào phòng. Đang chờ đối thủ..."}))
                 else:
-                    outbound.append((ws, {"type": "error", "msg_key": "online_room_full", "msg": "Phòng đã đầy"}))
+                    # Thiết lập trận đấu khi đủ 2 người...
 
-            if not outbound:
+            if outbound:
+                pass
+            else:
                 room.append(player)
                 if len(room) == 1:
                     player.update({
@@ -378,6 +385,7 @@ async def handler(ws):
                             "times": {"X": final_time, "O": final_time},
                         }))
 
+                    # First turn is authoritative and timed on the server too.
                     schedule_turn_locked(room, room_id, "X", TURN_SECS)
                     now = time.time()
                     times = current_match_times(state, now)
