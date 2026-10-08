@@ -148,27 +148,10 @@ async def safe_send(ws, data):
 
 
 async def send_many(items):
-    """Send concurrently between sockets, but sequentially per socket.
-
-    A room event can contain several packets for the same WebSocket (for example
-    rematch_waiting -> rematch -> turn_start). Sending those packets as separate
-    concurrent coroutines can reorder/interleave them on some websocket versions.
-    """
+    """Network I/O happens outside rooms_lock and in parallel."""
     if not items:
         return
-    grouped = {}
-    for ws, data in items:
-        grouped.setdefault(ws, []).append(data)
-
-    async def send_socket(ws, messages):
-        for data in messages:
-            if not await safe_send(ws, data):
-                break
-
-    await asyncio.gather(
-        *(send_socket(ws, messages) for ws, messages in grouped.items()),
-        return_exceptions=True,
-    )
+    await asyncio.gather(*(safe_send(ws, data) for ws, data in items), return_exceptions=True)
 
 
 async def start_timeout(room_id, expected_turn, expected_deadline):
@@ -315,37 +298,39 @@ async def handler(ws):
 
         async with rooms_lock:
             room = rooms.setdefault(room_id, [])
-            
-            # Lọc socket chết + cùng tên (reconnect)
-            room[:] = [p for p in room if not getattr(p["ws"], "closed", False) and p["name"] != name]
+            # Remove stale sockets without doing network I/O under the lock.
+            room[:] = [p for p in room if not getattr(p["ws"], "closed", False)]
 
             if len(room) >= 2:
-                outbound.append((ws, {"type": "error", "msg_key": "online_room_full", "msg": "Phòng đã đầy"}))
+                duplicate = next((p for p in room if p["name"] == name), None)
+                if duplicate:
+                    close_old = duplicate["ws"]
+                    room.remove(duplicate)
+                    state = room_state(room) if room else None
+                    if state:
+                        cancel_turn_task(state)
+                else:
+                    outbound.append((ws, {"type": "error", "msg_key": "online_room_full", "msg": "Phòng đã đầy"}))
+
+            if outbound:
+                pass
             else:
                 room.append(player)
                 if len(room) == 1:
-                    # Host giữ setting
                     player.update({
                         "board_size": board_size,
                         "rule": rule,
                         "time_limit": time_limit,
                         "auto_rotate": True,
                     })
-                    outbound.append((ws, {
-                        "type": "waiting",
-                        "msg_key": "online_waiting",
-                        "msg": "Đã vào phòng. Đang chờ đối thủ..."
-                    }))
+                    outbound.append((ws, {"type": "waiting", "msg_key": "online_waiting", "msg": "Đã vào phòng. Đang chờ đối thủ..."}))
                 else:
-                    # Đủ 2 người → chốt trận
                     host = room[0]
                     final_board = host.get("board_size") or board_size
                     final_rule = host.get("rule") or rule
                     final_time = parse_time_limit(host.get("time_limit", time_limit), time_limit)
                     host_sym = host.get("symbol", "X")
-                    # Client mới nhận quân đối diện nếu trùng
                     player["symbol"] = req_symbol if req_symbol != host_sym else opponent(host_sym)
-
                     state = host
                     state.update({
                         "time_limit": final_time,
@@ -378,7 +363,7 @@ async def handler(ws):
                             "times": {"X": final_time, "O": final_time},
                         }))
 
-                    # X đi trước, server lock deadline
+                    # First turn is authoritative and timed on the server too.
                     schedule_turn_locked(room, room_id, "X", TURN_SECS)
                     now = time.time()
                     times = current_match_times(state, now)
@@ -447,9 +432,10 @@ async def handler(ws):
                         if "rule" in payload:
                             sender["rule"] = clean(payload["rule"], 32, "Tiêu chuẩn")
                         if "time_limit" in payload:
-                            sender["time_limit"] = parse_time_limit(
-                                payload["time_limit"], sender.get("time_limit", 0)
-                            )
+                            try:
+                                sender["time_limit"] = max(0, int(payload["time_limit"]))
+                            except (TypeError, ValueError):
+                                pass
                         if "auto_rotate" in payload:
                             sender["auto_rotate"] = bool(payload["auto_rotate"])
                         if payload.get("symbol") in ("X", "O"):
@@ -566,11 +552,6 @@ async def handler(ws):
                         }) for p in room)
 
                     elif t == "rematch":
-                        # Rematch is valid only after the current game has ended.
-                        # The client normally hides the button earlier, but the
-                        # server must remain authoritative against stale/malicious packets.
-                        if not state.get("game_over"):
-                            continue
                         sender["rematch_ready"] = True
                         # Báo ngay cho cả phòng biết một người đã READY.
                         # Trước đây server chỉ gửi khi cả hai cùng READY, khiến
@@ -615,7 +596,7 @@ async def handler(ws):
                         has_moves = bool(state.get("board")) and any(
                             any(cell != "" for cell in row) for row in state["board"]
                         )
-                        if state.get("game_over") or not has_moves:
+                        if not has_moves:
                             new_sym = payload.get("symbol")
                             if new_sym not in ("X", "O"):
                                 continue
@@ -632,7 +613,7 @@ async def handler(ws):
                             }))
 
                     elif t in ("update_settings", "update_time_limit"):
-                        # Settings are applied before the first move or immediately after game over.
+                        # Settings are only applied safely before the first move.
                         has_moves = bool(state.get("board")) and any(
                             any(cell != "" for cell in row) for row in state["board"]
                         )
@@ -659,7 +640,7 @@ async def handler(ws):
                         if "auto_rotate" in payload:
                             state["auto_rotate"] = bool(payload["auto_rotate"])
                         # Symbol selection is locked once the first move exists.
-                        if (state.get("game_over") or not has_moves) and payload.get("symbol") in ("X", "O"):
+                        if not has_moves and payload.get("symbol") in ("X", "O"):
                             sender["symbol"] = payload["symbol"]
                             for p in others:
                                 p["symbol"] = opponent(sender["symbol"])
