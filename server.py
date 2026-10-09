@@ -623,7 +623,6 @@ async def handler(ws):
                         if applied or not has_moves:
                             changer = sender.get("name", "")
                             for p in room:
-                                # notify=True chỉ cho đối thủ → tránh trùng tên / echo
                                 outbound.append((p["ws"], {
                                     "type": "symbol_update",
                                     "symbol": p["symbol"],
@@ -659,8 +658,6 @@ async def handler(ws):
                                     state["match_remaining"] = {
                                         "X": float(new_limit), "O": float(new_limit)
                                     }
-                                    # The first turn already has a watchdog. Rebuild it
-                                    # so a changed limit cannot leave the old deadline alive.
                                     if state.get("turn") in ("X", "O") and not state.get("game_over"):
                                         schedule_turn_locked(
                                             room, room_id, state["turn"],
@@ -671,7 +668,6 @@ async def handler(ws):
                             if bool(state.get("auto_rotate", True)) != new_auto:
                                 changed_fields.append("auto_rotate")
                             state["auto_rotate"] = new_auto
-                        # Symbol selection is locked once the first move exists.
                         if not has_moves and payload.get("symbol") in ("X", "O"):
                             if sender.get("symbol") != payload["symbol"]:
                                 changed_fields.append("symbol")
@@ -679,7 +675,6 @@ async def handler(ws):
                             for p in others:
                                 p["symbol"] = opponent(sender["symbol"])
                         changer = sender.get("name", "")
-                        # Gửi cho cả phòng để đồng bộ UI, nhưng chỉ đối thủ hiện thông báo
                         for p in room:
                             outbound.append((p["ws"], {
                                 "type": "update_settings",
