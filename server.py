@@ -10,7 +10,7 @@ rooms = {}
 rooms_lock = asyncio.Lock()
 
 TURN_SECS = 35
-RESIGN_OFFER_SECS = 10
+RESIGN_OFFER_SECS = 15
 MAX_RESIGN_OFFERS = 2
 MAX_TIME_LIMIT_SECONDS = 7 * 24 * 60 * 60
 VALID_BOARDS = {"15x15": 15, "20x20": 20}
