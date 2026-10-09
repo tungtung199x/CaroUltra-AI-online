@@ -256,13 +256,24 @@ async def remove_player(room_id, ws):
             rooms.pop(room_id, None)
             return
         state = room_state(room)
-        # Force clear turn nếu chỉ còn 1 người
+        # Còn 1 người: dừng đồng hồ, xóa bàn, chờ đối thủ vào lại (không đá người còn lại)
         if len(room) == 1:
             cancel_turn_task(state)
             state["turn"] = None
             state["turn_deadline"] = None
             state["turn_started_at"] = None
+            state["task"] = None
             state["game_over"] = True
+            state["winner"] = None
+            state["last_move"] = None
+            # Reset bàn để khi đối thủ vào lại sẽ start sạch
+            try:
+                size = board_dimension(state.get("board_size", "20x20"))
+                state["board"] = make_board(size)
+            except Exception:
+                pass
+            for p in room:
+                p["rematch_ready"] = False
         for p in room:
             outbound.append((p["ws"], {
                 "type": "disconnect",
