@@ -578,8 +578,7 @@ async def handler(ws):
 
                     elif t == "rematch":
                         sender["rematch_ready"] = True
-                        # Nếu đang chơi dở (chưa game_over và đã có nước) → coi như đầu hàng.
-                        # Người còn lại thắng, rồi cả hai có thể bấm VÁN MỚI để bắt đầu ván mới.
+                        # Giữa ván (đã có nước, chưa game_over) → đầu hàng.
                         has_moves = bool(state.get("board")) and any(
                             any(cell != "" for cell in row) for row in state["board"]
                         )
@@ -613,7 +612,7 @@ async def handler(ws):
                                 "resigned_symbol": loser,
                             }) for p in room)
                         else:
-                            # Báo ngay cho cả phòng biết một người đã READY (sau khi ván đã kết thúc).
+                            # Sau khi ván đã kết thúc: báo READY bình thường
                             outbound.extend((p["ws"], {
                                 "type": "rematch_waiting",
                                 "ready_symbol": sender.get("symbol")
