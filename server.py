@@ -22,6 +22,16 @@ def clean(text, max_len=24, default=""):
     return text[:max_len] if text else default
 
 
+def normalize_rule(rule):
+    """Chuẩn hóa luật về mã trung lập — không phụ thuộc ngôn ngữ client."""
+    r = str(rule or "").strip().lower()
+    if r in ("block_both_ends", "block"):
+        return "block_both_ends"
+    if "block" in r or "chặn 2" in r or "chan 2" in r:
+        return "block_both_ends"
+    return "standard"
+
+
 def board_dimension(board_size):
     return VALID_BOARDS.get(board_size, 20)
 
@@ -97,7 +107,7 @@ def cancel_turn_task(state):
 def check_win(board, r, c, piece, rule):
     """Mirror the client's get_winning_line() logic for server authority."""
     n = len(board)
-    rule_l = str(rule or "").lower()
+    is_standard = normalize_rule(rule) == "standard"
     for dr, dc in ((0, 1), (1, 0), (1, 1), (1, -1)):
         cells = [(r, c)]
         blocked_pos = blocked_neg = False
@@ -127,9 +137,10 @@ def check_win(board, r, c, piece, rule):
             blocked_neg = True
 
         if len(cells) >= 5:
-            if "standard" in rule_l or "tiêu chuẩn" in rule_l:
+            if is_standard:
                 return cells
-            if ("chặn 2 đầu" in rule_l or "block" in rule_l) and blocked_pos and blocked_neg:
+            # Luật chặn 2 đầu: bị chặn cả hai đầu thì không thắng
+            if blocked_pos and blocked_neg:
                 continue
             return cells
     return []
@@ -221,7 +232,7 @@ def make_settings(state, player):
     own = player.get("symbol", "X")
     return {
         "board_size": state.get("board_size", "20x20"),
-        "rule": state.get("rule", "Tiêu chuẩn"),
+        "rule": normalize_rule(state.get("rule", "standard")),
         "time_limit": state.get("time_limit", 0),
         "auto_rotate": bool(state.get("auto_rotate", True)),
         "times": current_match_times(state),
@@ -286,7 +297,7 @@ async def handler(ws):
         board_size = data.get("board_size", "20x20")
         if board_size not in VALID_BOARDS:
             board_size = "20x20"
-        rule = clean(data.get("rule"), 32, "Tiêu chuẩn")
+        rule = normalize_rule(data.get("rule"))
         req_symbol = data.get("symbol") if data.get("symbol") in ("X", "O") else "X"
         if not room_id:
             await safe_send(ws, {"type": "error", "msg_key": "online_need_room", "msg": "Thiếu mã phòng"})
@@ -332,7 +343,7 @@ async def handler(ws):
                 else:
                     host = room[0]
                     final_board = host.get("board_size") or board_size
-                    final_rule = host.get("rule") or rule
+                    final_rule = normalize_rule(host.get("rule") or rule)
                     final_time = parse_time_limit(host.get("time_limit", time_limit), time_limit)
                     host_sym = host.get("symbol", "X")
                     player["symbol"] = req_symbol if req_symbol != host_sym else opponent(host_sym)
@@ -368,13 +379,8 @@ async def handler(ws):
                             "times": {"X": final_time, "O": final_time},
                         }))
 
-                    # Lượt đầu: X đi trước nhưng CHƯA bật đồng hồ — chỉ đếm sau nước đi đầu tiên.
-                    cancel_turn_task(state)
-                    state["turn"] = "X"
-                    state["turn_secs"] = float(TURN_SECS)
-                    state["turn_deadline"] = None
-                    state["turn_started_at"] = None
-                    state["task"] = None
+                    # First turn is authoritative and timed on the server too.
+                    schedule_turn_locked(room, room_id, "X", TURN_SECS)
                     now = time.time()
                     times = current_match_times(state, now)
                     for p in room:
@@ -382,7 +388,7 @@ async def handler(ws):
                             "type": "turn_start",
                             "symbol": "X",
                             "turn_secs": TURN_SECS,
-                            "deadline": None,
+                            "deadline": state.get("turn_deadline"),
                             "times": times,
                             "server_ts": now,
                         }))
@@ -444,7 +450,7 @@ async def handler(ws):
                         if "board_size" in payload and payload["board_size"] in VALID_BOARDS:
                             sender["board_size"] = payload["board_size"]
                         if "rule" in payload:
-                            sender["rule"] = clean(payload["rule"], 32, "Tiêu chuẩn")
+                            sender["rule"] = normalize_rule(payload["rule"])
                         if "time_limit" in payload:
                             try:
                                 sender["time_limit"] = max(0, int(payload["time_limit"]))
@@ -596,17 +602,12 @@ async def handler(ws):
                                     "symbol": p["symbol"],
                                     "auto_rotate": bool(state.get("auto_rotate", True)),
                                 }))
-                            # Ván mới: X đi trước nhưng chưa bật đồng hồ
-                            state["turn"] = "X"
-                            state["turn_secs"] = float(TURN_SECS)
-                            state["turn_deadline"] = None
-                            state["turn_started_at"] = None
-                            state["task"] = None
+                            schedule_turn_locked(room, room_id, "X", TURN_SECS)
                             now = time.time()
                             times = current_match_times(state, now)
                             outbound.extend((p["ws"], {
                                 "type": "turn_start", "symbol": "X", "turn_secs": TURN_SECS,
-                                "deadline": None, "times": times, "server_ts": now
+                                "deadline": state.get("turn_deadline"), "times": times, "server_ts": now
                             }) for p in room)
 
                     elif t == "symbol_update":
@@ -655,8 +656,8 @@ async def handler(ws):
                                 state["board_size"] = payload["board_size"]
                                 state["board"] = make_board(board_dimension(state["board_size"]))
                             if "rule" in payload:
-                                new_rule = clean(payload["rule"], 32, "Tiêu chuẩn")
-                                if state.get("rule") != new_rule:
+                                new_rule = normalize_rule(payload["rule"])
+                                if normalize_rule(state.get("rule")) != new_rule:
                                     changed_fields.append("rule")
                                 state["rule"] = new_rule
                             if "time_limit" in payload:
@@ -665,14 +666,14 @@ async def handler(ws):
                                     changed_fields.append("time_limit")
                                 state["time_limit"] = new_limit
                                 if not has_moves:
-                                    # Chưa có nước đi → chỉ reset đồng hồ, không bật đếm
                                     state["match_remaining"] = {
                                         "X": float(new_limit), "O": float(new_limit)
                                     }
-                                    cancel_turn_task(state)
-                                    state["turn_deadline"] = None
-                                    state["turn_started_at"] = None
-                                    state["task"] = None
+                                    if state.get("turn") in ("X", "O") and not state.get("game_over"):
+                                        schedule_turn_locked(
+                                            room, room_id, state["turn"],
+                                            state.get("turn_secs", TURN_SECS)
+                                        )
                         if "auto_rotate" in payload:
                             new_auto = bool(payload["auto_rotate"])
                             if bool(state.get("auto_rotate", True)) != new_auto:
