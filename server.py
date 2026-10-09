@@ -578,11 +578,11 @@ async def handler(ws):
 
                     elif t == "rematch":
                         sender["rematch_ready"] = True
-                        # Giữa ván (đã có nước, chưa game_over) → đầu hàng.
                         has_moves = bool(state.get("board")) and any(
                             any(cell != "" for cell in row) for row in state["board"]
                         )
                         if not state.get("game_over") and has_moves:
+                            # Giữa ván → đầu hàng
                             now = time.time()
                             consume_active_turn(state, now)
                             cancel_turn_task(state)
@@ -612,7 +612,6 @@ async def handler(ws):
                                 "resigned_symbol": loser,
                             }) for p in room)
                         else:
-                            # Sau khi ván đã kết thúc: báo READY bình thường
                             outbound.extend((p["ws"], {
                                 "type": "rematch_waiting",
                                 "ready_symbol": sender.get("symbol")
