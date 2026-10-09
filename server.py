@@ -379,8 +379,13 @@ async def handler(ws):
                             "times": {"X": final_time, "O": final_time},
                         }))
 
-                    # First turn is authoritative and timed on the server too.
-                    schedule_turn_locked(room, room_id, "X", TURN_SECS)
+                    # Lượt đầu: X đi trước nhưng CHƯA bật đồng hồ — chỉ đếm sau nước đi đầu.
+                    cancel_turn_task(state)
+                    state["turn"] = "X"
+                    state["turn_secs"] = float(TURN_SECS)
+                    state["turn_deadline"] = None
+                    state["turn_started_at"] = None
+                    state["task"] = None
                     now = time.time()
                     times = current_match_times(state, now)
                     for p in room:
@@ -388,7 +393,7 @@ async def handler(ws):
                             "type": "turn_start",
                             "symbol": "X",
                             "turn_secs": TURN_SECS,
-                            "deadline": state.get("turn_deadline"),
+                            "deadline": None,
                             "times": times,
                             "server_ts": now,
                         }))
@@ -602,12 +607,17 @@ async def handler(ws):
                                     "symbol": p["symbol"],
                                     "auto_rotate": bool(state.get("auto_rotate", True)),
                                 }))
-                            schedule_turn_locked(room, room_id, "X", TURN_SECS)
+                            # Ván mới: X đi trước nhưng chưa bật đồng hồ
+                            state["turn"] = "X"
+                            state["turn_secs"] = float(TURN_SECS)
+                            state["turn_deadline"] = None
+                            state["turn_started_at"] = None
+                            state["task"] = None
                             now = time.time()
                             times = current_match_times(state, now)
                             outbound.extend((p["ws"], {
                                 "type": "turn_start", "symbol": "X", "turn_secs": TURN_SECS,
-                                "deadline": state.get("turn_deadline"), "times": times, "server_ts": now
+                                "deadline": None, "times": times, "server_ts": now
                             }) for p in room)
 
                     elif t == "symbol_update":
@@ -666,14 +676,14 @@ async def handler(ws):
                                     changed_fields.append("time_limit")
                                 state["time_limit"] = new_limit
                                 if not has_moves:
+                                    # Chưa có nước → chỉ reset số phút, không bật đếm
                                     state["match_remaining"] = {
                                         "X": float(new_limit), "O": float(new_limit)
                                     }
-                                    if state.get("turn") in ("X", "O") and not state.get("game_over"):
-                                        schedule_turn_locked(
-                                            room, room_id, state["turn"],
-                                            state.get("turn_secs", TURN_SECS)
-                                        )
+                                    cancel_turn_task(state)
+                                    state["turn_deadline"] = None
+                                    state["turn_started_at"] = None
+                                    state["task"] = None
                         if "auto_rotate" in payload:
                             new_auto = bool(payload["auto_rotate"])
                             if bool(state.get("auto_rotate", True)) != new_auto:
