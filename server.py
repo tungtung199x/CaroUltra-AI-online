@@ -578,14 +578,46 @@ async def handler(ws):
 
                     elif t == "rematch":
                         sender["rematch_ready"] = True
-                        # Báo ngay cho cả phòng biết một người đã READY.
-                        # Trước đây server chỉ gửi khi cả hai cùng READY, khiến
-                        # máy còn lại vẫn hiển thị kết quả ván cũ dù đối thủ đã
-                        # bấm VÁN MỚI.
-                        outbound.extend((p["ws"], {
-                            "type": "rematch_waiting",
-                            "ready_symbol": sender.get("symbol")
-                        }) for p in room)
+                        # Nếu đang chơi dở (chưa game_over và đã có nước) → coi như đầu hàng.
+                        # Người còn lại thắng, rồi cả hai có thể bấm VÁN MỚI để bắt đầu ván mới.
+                        has_moves = bool(state.get("board")) and any(
+                            any(cell != "" for cell in row) for row in state["board"]
+                        )
+                        if not state.get("game_over") and has_moves:
+                            now = time.time()
+                            consume_active_turn(state, now)
+                            cancel_turn_task(state)
+                            loser = sender.get("symbol")
+                            winner = opponent(loser) if loser in ("X", "O") else None
+                            state["game_over"] = True
+                            state["winner"] = winner
+                            state["turn"] = None
+                            state["turn_deadline"] = None
+                            state["turn_started_at"] = None
+                            times = current_match_times(state, now)
+                            resign_payload = {
+                                "type": "game_result",
+                                "result": "resign",
+                                "winner": winner,
+                                "resigned_by": sender.get("name", ""),
+                                "resigned_symbol": loser,
+                                "line": [],
+                                "times": times,
+                                "server_ts": now,
+                            }
+                            outbound.extend((p["ws"], resign_payload) for p in room)
+                            outbound.extend((p["ws"], {
+                                "type": "rematch_waiting",
+                                "ready_symbol": sender.get("symbol"),
+                                "resigned_by": sender.get("name", ""),
+                                "resigned_symbol": loser,
+                            }) for p in room)
+                        else:
+                            # Báo ngay cho cả phòng biết một người đã READY (sau khi ván đã kết thúc).
+                            outbound.extend((p["ws"], {
+                                "type": "rematch_waiting",
+                                "ready_symbol": sender.get("symbol")
+                            }) for p in room)
                         if all(p.get("rematch_ready", False) for p in room):
                             if state.get("auto_rotate", True):
                                 for p in room:
