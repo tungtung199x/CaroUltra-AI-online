@@ -245,8 +245,13 @@ async def remove_player(room_id, ws):
             rooms.pop(room_id, None)
             return
         state = room_state(room)
-        task = state.get("task")
-        cancel_turn_task(state)
+        # Force clear turn nếu chỉ còn 1 người
+        if len(room) == 1:
+            cancel_turn_task(state)
+            state["turn"] = None
+            state["turn_deadline"] = None
+            state["turn_started_at"] = None
+            state["game_over"] = True
         for p in room:
             outbound.append((p["ws"], {
                 "type": "disconnect",
