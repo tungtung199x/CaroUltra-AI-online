@@ -405,6 +405,7 @@ async def handler(ws):
 
             outbound = []
             close_sender = False
+            do_leave = False
             async with rooms_lock:
                 room = rooms.get(room_id)
                 if not room:
@@ -415,7 +416,10 @@ async def handler(ws):
                 state = room_state(room)
                 t = payload.get("type")
 
-                if len(room) < 2:
+                if t == "leave":
+                    # Client chủ động báo thoát → xử lý ngay, không chờ TCP/ping timeout
+                    do_leave = True
+                elif len(room) < 2:
                     if t == "symbol_update":
                         # Trước khi trận bắt đầu, người chơi vẫn được đổi X/O/Tự động.
                         # Phòng chờ chưa có bàn cờ nên chưa có nước đi để khóa lựa chọn.
@@ -663,6 +667,10 @@ async def handler(ws):
                             outbound.append((p["ws"], payload))
 
             await send_many(outbound)
+            if do_leave:
+                player["_left"] = True
+                await remove_player(room_id, ws)
+                break
 
     except (asyncio.CancelledError, websockets.exceptions.ConnectionClosed):
         pass
@@ -670,7 +678,7 @@ async def handler(ws):
         # A single malformed client must never bring down the server.
         pass
     finally:
-        if room_id and player:
+        if room_id and player and not player.get("_left"):
             await remove_player(room_id, ws)
 
 
@@ -681,8 +689,8 @@ async def main():
         handler,
         "0.0.0.0",
         port,
-        ping_interval=30,
-        ping_timeout=20,
+        ping_interval=15,
+        ping_timeout=8,
         max_size=MAX_MESSAGE_BYTES,
         max_queue=32,
     ):
