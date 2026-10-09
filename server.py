@@ -605,35 +605,55 @@ async def handler(ws):
                         has_moves = bool(state.get("board")) and any(
                             any(cell != "" for cell in row) for row in state["board"]
                         )
+                        applied = False
                         if not has_moves:
                             new_sym = payload.get("symbol")
                             if new_sym not in ("X", "O"):
                                 continue
+                            if sender.get("symbol") != new_sym:
+                                applied = True
                             sender["symbol"] = new_sym
                             for p in others:
                                 p["symbol"] = opponent(new_sym)
                             if "auto_rotate" in payload:
-                                state["auto_rotate"] = bool(payload["auto_rotate"])
-                        for p in room:
-                            outbound.append((p["ws"], {
-                                "type": "symbol_update", "symbol": p["symbol"],
-                                "opponent_symbol": opponent(p["symbol"]),
-                                "auto_rotate": bool(state.get("auto_rotate", False)),
-                            }))
+                                new_auto = bool(payload["auto_rotate"])
+                                if bool(state.get("auto_rotate", True)) != new_auto:
+                                    applied = True
+                                state["auto_rotate"] = new_auto
+                        if applied or not has_moves:
+                            changer = sender.get("name", "")
+                            for p in room:
+                                # notify=True chỉ cho đối thủ → tránh trùng tên / echo
+                                outbound.append((p["ws"], {
+                                    "type": "symbol_update",
+                                    "symbol": p["symbol"],
+                                    "opponent_symbol": opponent(p["symbol"]),
+                                    "auto_rotate": bool(state.get("auto_rotate", False)),
+                                    "changed_by": changer,
+                                    "notify": p["ws"] is not ws,
+                                }))
 
                     elif t in ("update_settings", "update_time_limit"):
                         # Settings are only applied safely before the first move.
                         has_moves = bool(state.get("board")) and any(
                             any(cell != "" for cell in row) for row in state["board"]
                         )
+                        changed_fields = []
                         if state.get("game_over") or not has_moves:
                             if payload.get("board_size") in VALID_BOARDS:
+                                if state.get("board_size") != payload["board_size"]:
+                                    changed_fields.append("board_size")
                                 state["board_size"] = payload["board_size"]
                                 state["board"] = make_board(board_dimension(state["board_size"]))
                             if "rule" in payload:
-                                state["rule"] = clean(payload["rule"], 32, "Tiêu chuẩn")
+                                new_rule = clean(payload["rule"], 32, "Tiêu chuẩn")
+                                if state.get("rule") != new_rule:
+                                    changed_fields.append("rule")
+                                state["rule"] = new_rule
                             if "time_limit" in payload:
                                 new_limit = parse_time_limit(payload["time_limit"], state.get("time_limit", 0))
+                                if int(state.get("time_limit", 0)) != int(new_limit):
+                                    changed_fields.append("time_limit")
                                 state["time_limit"] = new_limit
                                 if not has_moves:
                                     state["match_remaining"] = {
@@ -647,14 +667,27 @@ async def handler(ws):
                                             state.get("turn_secs", TURN_SECS)
                                         )
                         if "auto_rotate" in payload:
-                            state["auto_rotate"] = bool(payload["auto_rotate"])
+                            new_auto = bool(payload["auto_rotate"])
+                            if bool(state.get("auto_rotate", True)) != new_auto:
+                                changed_fields.append("auto_rotate")
+                            state["auto_rotate"] = new_auto
                         # Symbol selection is locked once the first move exists.
                         if not has_moves and payload.get("symbol") in ("X", "O"):
+                            if sender.get("symbol") != payload["symbol"]:
+                                changed_fields.append("symbol")
                             sender["symbol"] = payload["symbol"]
                             for p in others:
                                 p["symbol"] = opponent(sender["symbol"])
+                        changer = sender.get("name", "")
+                        # Gửi cho cả phòng để đồng bộ UI, nhưng chỉ đối thủ hiện thông báo
                         for p in room:
-                            outbound.append((p["ws"], {"type": "update_settings", **make_settings(state, p)}))
+                            outbound.append((p["ws"], {
+                                "type": "update_settings",
+                                **make_settings(state, p),
+                                "changed_by": changer,
+                                "changed_fields": changed_fields,
+                                "notify": p["ws"] is not ws,
+                            }))
 
                     elif t == "chat":
                         text = clean(payload.get("text"), 500)
